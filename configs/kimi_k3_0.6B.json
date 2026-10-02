@@ -1,0 +1,26 @@
+{
+  "arch": "kimi_k3",
+  "model": {
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "kda_num_heads": 16,
+    "kda_head_dim": 128,
+    "conv_size": 4,
+    "attention_interval": 4,
+    "tie_word_embeddings": true
+  },
+  "train": {
+    "seq_len": 2048,
+    "device_batch_size": 2,
+    "total_batch_size": 32768,
+    "total_tokens": 1e10,
+    "lr": 6e-4,
+    "warmup_steps": 1000,
+    "eval_every": 500,
+    "save_every": 2000
+  }
+}
