@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+"""
+Stage 2: Draft fine-tuning with recursive unroll and LK acceptance-overlap loss.
+
+Trains a pretrained MTP block (from Stage 1) plus a feature projection layer
+against a frozen target model.  The draft block is called recursively: start
+from fused target features, then feed each draft hidden output back into the
+same block at the next step.
+
+Key design choices (from the implementation brief):
+- Teacher-forced: use shifted ground-truth token embeddings (not sampled tokens).
+- LK (acceptance-overlap) loss at temperature 1 (NVIDIA "alpha" objective).
+- Causal draft attention history maintained across recursive steps.
+- Feature projection: Linear(3d, d), initialized as [0, 0, I] so initial
+  projected feature equals the high feature used in Stage 1.
+
+Reference: NVIDIA Automodel eagle/core.py (Eagle3TrainerModule, _lk_step_loss)
+Reference: NVIDIA Automodel eagle/draft_kimi_k3.py (Eagle3KimiK3Model.__init__)
+"""
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ..models.mtp import MTPBlock
+from ..layers import RMSNorm
+
+
+@dataclass
+class DraftConfig:
+    """Configuration for Stage 2 draft training."""
+    draft_steps: int = 4  # Number of recursive unroll steps (supports up to 7)
+    # Feature layer indices for low/mid/high fusion.
+    # Must match the feature_layer_indices used during Stage 1.
+    feature_layer_indices: list[int] = field(default_factory=list)
+    # Loss settings
+    lk_temperature: float = 1.0
+    lk_eps: float = 1e-8
+    # Step loss weighting: 'uniform' or 'decay'
+    step_loss_weighting: str = "uniform"
+    step_loss_decay: float = 0.9  # Per-step decay factor when weighting='decay'
+
+
+class FeatureProjection(nn.Module):
+    """Bias-free Linear(3d, d) for low/mid/high target feature fusion.
+
+    Initialized with zero blocks for low and mid features, and an identity
+    block for the high feature, so that the initial projection output equals
+    exactly the high feature used in Stage 1.
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size * 3, hidden_size, bias=False)
+
+    def init_identity_high(self) -> None:
+        """Initialize so proj([low, mid, high]) = high exactly.
+
+        Weight shape is (d, 3d).  Split into three (d, d) blocks:
+          [W_low | W_mid | W_high]
+        Set W_low = 0, W_mid = 0, W_high = I.
+        """
+        d = self.proj.weight.shape[0]
+        with torch.no_grad():
+            self.proj.weight.zero_()
+            self.proj.weight[:, 2 * d:].copy_(torch.eye(d, device=self.proj.weight.device, dtype=self.proj.weight.dtype))
+
+    def forward(self, low: torch.Tensor, mid: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            low, mid, high: (B, T, D) target features from early/middle/final layers.
+
+        Returns:
+            (B, T, D) fused feature.
+        """
+        return self.proj(torch.cat([low, mid, high], dim=-1))
+
+
+def lk_loss(
+    target_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Pure LK (acceptance-overlap) loss at temperature 1.
+
+    LK loss = -log(overlap) where overlap = sum_v min(p_v, q_v).
+
+    This is the "alpha" objective from NVIDIA's Eagle3 training.
+
+    Args:
+        target_logits: (B, T, V) logits from the frozen target.
+        draft_logits: (B, T, V) logits from the draft model.
+        mask: (B, T) boolean mask of valid positions.
+        eps: clamp minimum for numerical stability.
+
+    Returns:
+        Scalar loss: masked mean of -log(overlap).
+    """
+    # Full vocabulary, float32 for probability/loss calculations
+    p = torch.softmax(target_logits.float(), dim=-1).detach()  # target probs, no grad
+    q = torch.softmax(draft_logits.float(), dim=-1)
+    overlap = torch.minimum(p, q).sum(dim=-1)  # (B, T)
+    per_position_loss = -torch.log(overlap.clamp_min(eps))  # (B, T)
+
+    # Masked mean
+    mask_float = mask.float()
+    denom = mask_float.sum().clamp_min(1.0)
+    return (per_position_loss * mask_float).sum() / denom
+
+
+def compute_overlap_and_agreement(
+    target_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[float, float]:
+    """Compute mean overlap and top-1 agreement for logging.
+
+    Args:
+        target_logits: (B, T, V) target logits.
+        draft_logits: (B, T, V) draft logits.
+        mask: (B, T) boolean valid positions.
+
+    Returns:
+        (overlap, top1_agreement) as Python floats.
+    """
+    with torch.no_grad():
+        p = torch.softmax(target_logits.float(), dim=-1)
+        q = torch.softmax(draft_logits.float(), dim=-1)
+        overlap = torch.minimum(p, q).sum(dim=-1)  # (B, T)
+        top1_agree = (target_logits.argmax(-1) == draft_logits.argmax(-1)).float()
+
+        mask_float = mask.float()
+        denom = mask_float.sum().clamp_min(1.0)
+        mean_overlap = (overlap * mask_float).sum() / denom
+        mean_agree = (top1_agree * mask_float).sum() / denom
+    return mean_overlap.item(), mean_agree.item()
+
+
+class DraftTrainer(nn.Module):
+    """Manages the draft model for Stage 2 training.
+
+    Contains:
+    - A pretrained MTP block (initialized from Stage 1 checkpoint).
+    - A FeatureProjection layer for low/mid/high fusion.
+
+    The target model is external and frozen; it is passed to the forward method.
+    """
+
+    def __init__(self, mtp_block: MTPBlock, config: DraftConfig):
+        super().__init__()
+        self.config = config
+        self.mtp_block = mtp_block
+        self.feature_proj = FeatureProjection(mtp_block.hidden_size)
+        # Initialize projection so output = high feature (identity on high block)
+        self.feature_proj.init_identity_high()
+
+    def get_trainable_parameters(self) -> list[nn.Parameter]:
+        """Return only the parameters that should be optimized in Stage 2."""
+        params = list(self.mtp_block.parameters()) + list(self.feature_proj.parameters())
+        return params
+
+    def forward(
+        self,
+        target_features: dict[str, torch.Tensor],
+        target_logits: torch.Tensor,
+        targets: torch.Tensor,
+        embed_fn: callable,
+        lm_head_fn: callable,
+        output_norm_fn: callable | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run recursive draft unroll and compute LK loss.
+
+        Args:
+            target_features: dict from target model's extract_features, containing
+                'final_hidden' and 'feature_<idx>' entries.
+            target_logits: (B, T, V) logits from the frozen target.
+            targets: (B, T) ground truth token IDs.
+            embed_fn: embedding function (token_ids -> embeddings).
+            lm_head_fn: vocabulary head function (hidden -> logits).
+            output_norm_fn: optional normalization before lm_head (if not using
+                            mtp_block.get_output_hidden).
+
+        Returns:
+            Dict with 'loss', 'per_step_loss', 'per_step_overlap', 'per_step_agreement'.
+        """
+        cfg = self.config
+        B, T, V = target_logits.shape
+        device = target_logits.device
+
+        # --- Gather low/mid/high features ---
+        feature_indices = cfg.feature_layer_indices
+        assert len(feature_indices) == 3, f"Need exactly 3 feature indices (low/mid/high), got {len(feature_indices)}"
+
+        low_feat = target_features[f"feature_{feature_indices[0]}"]
+        mid_feat = target_features[f"feature_{feature_indices[1]}"]
+        high_feat = target_features[f"feature_{feature_indices[2]}"]
+
+        # --- Fuse features ---
+        fused_features = self.feature_proj(low_feat, mid_feat, high_feat)  # (B, T, D)
+
+        # --- Recursive unroll with teacher-forced token embeddings ---
+        # For an anchor at position t, step r (1-indexed):
+        #   - consumes token embedding x[t+r]
+        #   - supervises the distribution for x[t+r+1]
+        #
+        # We implement this by shifting targets for each step.
+        # Step 0 hidden = fused_features
+        # Step r: draft_hidden = mtp_block(prev_hidden[:, :-1], embed(targets[:, r-1:-1]))
+        #         draft supervised by target_logits shifted by r positions
+
+        per_step_losses = []
+        per_step_overlaps = []
+        per_step_agreements = []
+
+        # Current hidden state for the draft (starts from fused target features)
+        draft_hidden = fused_features
+
+        for step_r in range(1, cfg.draft_steps + 1):
+            # Valid region: we need targets[t + step_r] as input and
+            # targets[t + step_r + 1] (or equivalently target_logits[t + step_r])
+            # as supervision.
+            # But since target_logits[t] predicts targets[t] (= next token of input[t]),
+            # the supervision logits for step r at anchor t are target_logits[t + step_r - 1]
+            # Wait -- let me be precise about the alignment:
+            #
+            # targets[:, t] is the token following inputs[:, t].
+            # target_logits[:, t] produces distribution over targets[:, t].
+            #
+            # For draft step r=1 at anchor t:
+            #   - Input embedding: embed(targets[:, t])  (= token at position t+1)
+            #   - Supervision: target distribution for token at position t+2 = target_logits[:, t+1]
+            #   - Draft hidden input: fused_features[:, t] (or prev_hidden[:, t])
+            #
+            # So for step r:
+            #   - Input token: targets[:, (r-1) : T-(1)]  shifted r-1 from start
+            #   - Supervision logits: target_logits[:, r : T]
+            #   - Supervision targets: targets[:, r : T]  (for mask building)
+            #   - Draft hidden: prev_hidden[:, : T-r]
+
+            if T - step_r < 1:
+                # Sequence too short for this step
+                break
+
+            # Slice hidden states and embeddings
+            hidden_input = draft_hidden[:, :T - step_r]  # (B, T-step_r, D)
+
+            # Teacher-forced token embeddings
+            token_ids = targets[:, step_r - 1: T - 1].clone()  # (B, T-step_r)
+            valid_tokens = token_ids != -100
+            token_ids[~valid_tokens] = 0
+            token_emb = embed_fn(token_ids)  # (B, T-step_r, D)
+            token_emb = token_emb * valid_tokens.unsqueeze(-1).float()
+
+            # Run MTP block
+            draft_hidden_out = self.mtp_block(hidden_input, token_emb)  # (B, T-step_r, D)
+
+            # Get draft logits
+            draft_norm = self.mtp_block.get_output_hidden(draft_hidden_out)
+            draft_logits = lm_head_fn(draft_norm)  # (B, T-step_r, V)
+
+            # Supervision: target logits shifted by step_r
+            sup_target_logits = target_logits[:, step_r:T]  # (B, T-step_r, V)
+            sup_targets = targets[:, step_r:T]  # for building mask
+
+            # Valid mask: both the input token and supervision must be valid
+            step_mask = (sup_targets != -100) & valid_tokens  # (B, T-step_r)
+
+            # Compute LK loss for this step
+            if step_mask.any():
+                step_loss = lk_loss(sup_target_logits, draft_logits, step_mask, eps=cfg.lk_eps)
+                overlap, agreement = compute_overlap_and_agreement(
+                    sup_target_logits, draft_logits, step_mask
+                )
+            else:
+                step_loss = torch.zeros((), device=device)
+                overlap, agreement = 0.0, 0.0
+
+            per_step_losses.append(step_loss)
+            per_step_overlaps.append(overlap)
+            per_step_agreements.append(agreement)
+
+            # Feed back draft hidden states for the next recursive step.
+            # Pad back to length T for uniform slicing in the next step.
+            # We create a new tensor to keep gradient flow clean.
+            new_hidden = torch.zeros_like(fused_features)
+            new_hidden[:, :T - step_r] = draft_hidden_out
+            draft_hidden = new_hidden
+
+        # --- Combine step losses ---
+        if not per_step_losses:
+            total_loss = torch.zeros((), device=device, requires_grad=True)
+        else:
+            num_steps = len(per_step_losses)
+            if cfg.step_loss_weighting == "decay":
+                weights = torch.tensor(
+                    [cfg.step_loss_decay ** i for i in range(num_steps)],
+                    device=device,
+                )
+            else:  # uniform
+                weights = torch.ones(num_steps, device=device)
+
+            # Normalize weights
+            weights = weights / weights.sum()
+            total_loss = sum(w * l for w, l in zip(weights, per_step_losses))
+
+        return {
+            "loss": total_loss,
+            "per_step_loss": [l.item() if isinstance(l, torch.Tensor) else l for l in per_step_losses],
+            "per_step_overlap": per_step_overlaps,
+            "per_step_agreement": per_step_agreements,
+        }

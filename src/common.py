@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -38,14 +39,56 @@ def get_peak_flops(device: torch.device) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, steps: int) -> float:
+def evaluate(model: nn.Module, loader, steps: int, return_metrics: bool = False) -> float | dict[str, float]:
+    """Evaluate model and return the main (next-token) loss or a dict of metrics.
+
+    Args:
+        model: model to evaluate.
+        loader: data loader.
+        steps: evaluation steps.
+        return_metrics: if True, returns a dict with 'val/loss', 'val/ppl',
+            and optional 'val/mtp_loss', 'val/mtp_agreement', 'val/main_agreement'.
+            If False (default), returns float val_loss.
+    """
     model.eval()
     total_loss = 0.0
+    total_mtp_loss = 0.0
+    total_main_agree = 0.0
+    total_mtp_agree = 0.0
+    has_mtp = False
+
     for _ in range(steps):
         inputs, targets = next(loader)
-        total_loss = total_loss + model(inputs, targets)
+        result = model(inputs, targets)
+        if isinstance(result, dict):
+            total_loss = total_loss + result["main_loss"]
+            if "mtp_loss" in result:
+                has_mtp = True
+                total_mtp_loss = total_mtp_loss + result["mtp_loss"]
+            if "mtp_agreement" in result:
+                total_mtp_agree = total_mtp_agree + result["mtp_agreement"]
+            if "main_agreement" in result:
+                total_main_agree = total_main_agree + result["main_agreement"]
+        else:
+            total_loss = total_loss + result
+
     model.train()
-    return all_reduce_mean(total_loss / steps).item()
+    main_loss_val = all_reduce_mean(total_loss / steps).item()
+
+    if not return_metrics:
+        return main_loss_val
+
+    metrics = {
+        "val/loss": main_loss_val,
+        "val/ppl": math.exp(main_loss_val) if main_loss_val < 20 else float("inf"),
+    }
+    if has_mtp:
+        metrics["val/mtp_loss"] = all_reduce_mean(total_mtp_loss / steps).item()
+        metrics["val/mtp_agreement"] = all_reduce_mean(total_mtp_agree / steps).item()
+    if isinstance(total_main_agree, torch.Tensor) or total_main_agree > 0:
+        metrics["val/main_agreement"] = all_reduce_mean(total_main_agree / steps).item()
+
+    return metrics
 
 
 def save_checkpoint(path: Path, model: nn.Module, optimizer, loader, step: int, config) -> None:
@@ -59,9 +102,36 @@ def save_checkpoint(path: Path, model: nn.Module, optimizer, loader, step: int, 
     torch.save(checkpoint, path)
 
 
-def load_checkpoint(path: Path, model: nn.Module, optimizer, loader) -> int:
+def load_checkpoint(path: Path, model: nn.Module, optimizer, loader, strict: bool = True) -> int:
+    """Load a checkpoint into the model.
+
+    Args:
+        path: checkpoint file.
+        model: model to load into.
+        optimizer: optimizer to load state into.
+        loader: data loader to restore iteration state.
+        strict: if False, allow missing keys (e.g. loading a target-only
+                checkpoint into an MTP-enabled model and initializing only
+                the missing MTP parameters fresh).
+
+    Returns:
+        The training step number stored in the checkpoint.
+    """
     checkpoint = torch.load(path, map_location="cpu")
-    model.load_state_dict(checkpoint["model"])
+    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+    if strict and (missing or unexpected):
+        # Re-raise with the standard strict error
+        model.load_state_dict(checkpoint["model"], strict=True)
+    elif missing:
+        print0(f"[checkpoint] Loaded with {len(missing)} missing keys (initialized fresh):")
+        for k in missing[:20]:
+            print0(f"  {k}")
+        if len(missing) > 20:
+            print0(f"  ... and {len(missing) - 20} more")
+    if unexpected:
+        print0(f"[checkpoint] {len(unexpected)} unexpected keys ignored:")
+        for k in unexpected[:10]:
+            print0(f"  {k}")
     optimizer.load_state_dict(checkpoint["optimizer"])
     loader.load_state_dict(checkpoint["loader"])
     return checkpoint["step"]

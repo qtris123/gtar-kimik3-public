@@ -32,6 +32,7 @@ class KimiDeltaAttention(nn.Module):
         self.A_log = nn.Parameter(torch.log(torch.empty(num_heads).uniform_(1, 16)))
         dt = torch.exp(torch.empty(inner_size).uniform_(math.log(1e-3), math.log(1e-1)))
         self.decay_proj[1].bias.data = dt + torch.log(-torch.expm1(-dt))
+        self.stats = None
 
     def make_cache(self, batch_size: int, max_seq_len: int, device, dtype) -> RecurrentCache:
         inner_size = self.num_heads * self.head_dim
@@ -55,5 +56,14 @@ class KimiDeltaAttention(nn.Module):
         )
         if cache is not None:
             cache.update(final_state, seq_len)
-        out = self.norm(out.transpose(1, 2)) * F.silu(self.output_gate_proj(hidden_states).view(head_shape))
+        out_gate = F.silu(self.output_gate_proj(hidden_states).view(head_shape))
+        out = self.norm(out.transpose(1, 2)) * out_gate
+
+        self.stats = torch.stack([
+            beta.detach().mean(),
+            gate.detach().exp().mean(),
+            final_state.detach().norm(dim=(-2, -1)).mean(),
+            out_gate.detach().mean(),
+        ])
+
         return self.o_proj(out.reshape(batch_size, seq_len, -1))

@@ -1,0 +1,49 @@
+{
+  "arch": "kimi_k3",
+  "model": {
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "kda_num_heads": 16,
+    "kda_head_dim": 128,
+    "conv_size": 4,
+    "attention_interval": 4,
+    "tie_word_embeddings": true,
+    "mtp_enabled": true,
+    "mtp_loss_weight": 0.3,
+    "feature_layer_indices": [
+      3,
+      13,
+      27
+    ]
+  },
+  "train": {
+    "seq_len": 2048,
+    "device_batch_size": 8,
+    "total_batch_size": 524288,
+    "total_tokens": 1e10,
+    "lr": 6e-4,
+    "warmup_steps": 63,
+    "eval_every": 100,
+    "save_every": 1000
+  },
+  "draft_train": {
+    "seq_len": 2048,
+    "device_batch_size": 8,
+    "total_batch_size": 524288,
+    "total_tokens": 1e9,
+    "lr": 1e-4,
+    "warmup_steps": 100,
+    "eval_every": 100,
+    "save_every": 500,
+    "draft_steps": 7
+  },
+  "_comment": [
+    "Kimi doesn't publish mtp_loss_weight or lr on 2nd stage. Deepseek does for mtp_loss_weight",
+    "starting with 0.3 for first 10T tokens and 0.1 for remaining 4.8T (curriculum learning on mtp loss).",
+    "While for lr in stage 2, original EAGLE paper and SpecForge usu from 5e-5 and 1e-4 -> resort to 1e-4"
+  ]
+}
