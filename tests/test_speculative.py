@@ -479,6 +479,7 @@ if __name__ == "__main__":
     test_max_new_tokens_boundary()
     test_draft_trainer_trajectory_matches_actual_inference_draft_path()
     test_persistent_draft_prefix_across_speculation_rounds()
+    test_incremental_vs_rebuilt_drafter_kv_state()
 
     print("=" * 60)
     print("All speculative decoding tests passed!")

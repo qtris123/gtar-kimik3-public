@@ -106,14 +106,10 @@ def lk_loss(
     q = torch.softmax(draft_logits.float(), dim=-1)
     overlap = torch.minimum(p, q).sum(dim=-1)  # (B, T)
     
-    # More numerically stable: handle exact zeros explicitly
-    # When overlap is exactly 0, set loss to a large finite value instead of inf
-    zero_overlap = overlap == 0.0
-    overlap_safe = torch.where(zero_overlap, eps, overlap)
-    per_position_loss = -torch.log(overlap_safe)  # (B, T)
-    
-    # For zero overlaps, use a large but finite loss value
-    per_position_loss = torch.where(zero_overlap, -torch.log(torch.tensor(eps, device=overlap.device)), per_position_loss)
+    # NVIDIA-style zero-overlap handling: preserve gradient for positive overlap, avoid inf/NaN for exact zero
+    safe_log = torch.log(overlap.clamp_min(torch.finfo(overlap.dtype).tiny))
+    log_overlap = torch.where(overlap > 0, safe_log, torch.zeros_like(overlap))
+    per_position_loss = -log_overlap  # (B, T)
 
     # Masked mean
     mask_float = mask.float()
@@ -125,7 +121,7 @@ def compute_overlap_and_agreement(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor,
     mask: torch.Tensor,
-) -> tuple[float, float]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute mean overlap and top-1 agreement for logging.
 
     Args:
@@ -134,7 +130,7 @@ def compute_overlap_and_agreement(
         mask: (B, T) boolean valid positions.
 
     Returns:
-        (overlap, top1_agreement) as Python floats.
+        (overlap, top1_agreement) as tensors.
     """
     with torch.no_grad():
         p = torch.softmax(target_logits.float(), dim=-1)
@@ -146,7 +142,7 @@ def compute_overlap_and_agreement(
         denom = mask_float.sum().clamp_min(1.0)
         mean_overlap = (overlap * mask_float).sum() / denom
         mean_agree = (top1_agree * mask_float).sum() / denom
-    return mean_overlap.item(), mean_agree.item()
+    return mean_overlap, mean_agree
 
 
 class DraftTrainer(nn.Module):
@@ -295,7 +291,8 @@ class DraftTrainer(nn.Module):
                 )
             else:
                 step_loss = torch.zeros((), device=device)
-                overlap, agreement = 0.0, 0.0
+                zero = torch.zeros((), device=device)
+                overlap, agreement = zero, zero
 
             per_step_losses.append(step_loss)
             per_step_overlaps.append(overlap)

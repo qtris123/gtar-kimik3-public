@@ -39,6 +39,8 @@
     "save_every": 100,
     "log_every": 5,
     "draft_steps": 7,
+    "step_loss_weighting": "decay",
+    "step_loss_decay": 0.8,
     "lr": 3e-4
   }
 }

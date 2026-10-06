@@ -58,8 +58,8 @@ parser.add_argument("--save-total-limit", type=int, default=3)
 parser.add_argument("--log-every", type=int, default=10)
 parser.add_argument("--max-steps", type=int, default=None)
 parser.add_argument("--draft-steps", type=int, default=4, help="number of recursive unroll steps")
-parser.add_argument("--step-loss-weighting", default="uniform", choices=["uniform", "decay"])
-parser.add_argument("--step-loss-decay", type=float, default=0.9)
+parser.add_argument("--step-loss-weighting", default="decay", choices=["uniform", "decay"])
+parser.add_argument("--step-loss-decay", type=float, default=0.8)
 parser.add_argument("--resume", default=None, help="draft checkpoint to resume from")
 parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--wandb", default=None, help="wandb run name")
@@ -217,6 +217,7 @@ def save_draft_checkpoint(path, draft_trainer_module, optimizer, loader, step, t
     """Save a draft checkpoint with all state needed for resume."""
     import subprocess
     import os
+    import hashlib
     
     # Get git commit SHA for reproducibility
     git_sha = "unknown"
@@ -230,13 +231,16 @@ def save_draft_checkpoint(path, draft_trainer_module, optimizer, loader, step, t
     except:
         pass
     
-    # Extract step number from target checkpoint name
+    # Load target checkpoint to get step and compute SHA256
     target_step = "unknown"
+    target_checkpoint_sha256 = "unknown"
     try:
-        import re
-        match = re.search(r'ckpt_(\d+)\.pt', str(target_ckpt_path))
-        if match:
-            target_step = int(match.group(1))
+        target_ckpt = torch.load(target_ckpt_path, map_location="cpu")
+        target_step = target_ckpt.get("step", "unknown")
+        
+        # Compute SHA256 of target checkpoint file
+        with open(target_ckpt_path, "rb") as f:
+            target_checkpoint_sha256 = hashlib.sha256(f.read()).hexdigest()
     except:
         pass
     
@@ -249,6 +253,7 @@ def save_draft_checkpoint(path, draft_trainer_module, optimizer, loader, step, t
         "draft_config": asdict(draft_config),
         "target_checkpoint": str(target_ckpt_path),
         "target_step": target_step,
+        "target_checkpoint_sha256": target_checkpoint_sha256,
         "git_commit_sha": git_sha,
         "creation_timestamp": time.time(),
     }
@@ -367,20 +372,20 @@ while True:
         # Accumulate per-step metrics across all microsteps
         if draft_result["per_step_overlap"]:
             if not accum_per_step_overlap:
-                accum_per_step_overlap = [0.0] * len(draft_result["per_step_overlap"])
-                accum_per_step_agree = [0.0] * len(draft_result["per_step_agreement"])
+                accum_per_step_overlap = [torch.zeros((), device=device)] * len(draft_result["per_step_overlap"])
+                accum_per_step_agree = [torch.zeros((), device=device)] * len(draft_result["per_step_agreement"])
             
             for i, (ov, ag) in enumerate(zip(draft_result["per_step_overlap"], draft_result["per_step_agreement"])):
-                accum_per_step_overlap[i] += ov
-                accum_per_step_agree[i] += ag
+                accum_per_step_overlap[i] += ov.detach() if isinstance(ov, torch.Tensor) else torch.tensor(ov, device=device)
+                accum_per_step_agree[i] += ag.detach() if isinstance(ag, torch.Tensor) else torch.tensor(ag, device=device)
                 step_counts[i] = step_counts.get(i, 0) + 1
 
     # Average per-step metrics across microsteps
     if accum_per_step_overlap:
         for i in range(len(accum_per_step_overlap)):
             if step_counts.get(i, 0) > 0:
-                accum_per_step_overlap[i] /= step_counts[i]
-                accum_per_step_agree[i] /= step_counts[i]
+                accum_per_step_overlap[i] = accum_per_step_overlap[i] / step_counts[i]
+                accum_per_step_agree[i] = accum_per_step_agree[i] / step_counts[i]
 
     # Optimizer step
     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
@@ -398,10 +403,22 @@ while True:
         train_loss = all_reduce_mean(accum_loss).item()
         tokens_per_sec = args.total_batch_size / dt
 
+        # All-reduce per-step metrics across DDP ranks
         step_metrics = {}
-        for i, (ov, ag) in enumerate(zip(accum_per_step_overlap, accum_per_step_agree)):
-            step_metrics[f"draft/step{i+1}_overlap"] = ov
-            step_metrics[f"draft/step{i+1}_agreement"] = ag
+        for i in range(len(accum_per_step_overlap)):
+            ov = all_reduce_mean(accum_per_step_overlap[i])
+            ag = all_reduce_mean(accum_per_step_agree[i])
+            
+            # Convert to floats for logging
+            ov_val = ov.item()
+            ag_val = ag.item()
+            
+            step_metrics[f"draft/step{i+1}_overlap"] = ov_val
+            step_metrics[f"draft/step{i+1}_agreement"] = ag_val
+            
+            # Update for printing
+            accum_per_step_overlap[i] = ov_val
+            accum_per_step_agree[i] = ag_val
 
         overlap_str = " ".join(f"{o:.3f}" for o in accum_per_step_overlap)
         agree_str = " ".join(f"{a:.3f}" for a in accum_per_step_agree)

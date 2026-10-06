@@ -39,7 +39,9 @@
     "warmup_steps": 100,
     "eval_every": 100,
     "save_every": 500,
-    "draft_steps": 7
+    "draft_steps": 7,
+    "step_loss_weighting": "decay",
+    "step_loss_decay": 0.8
   },
   "_comment": [
     "Kimi doesn't publish mtp_loss_weight or lr on 2nd stage. Deepseek does for mtp_loss_weight",
