@@ -215,6 +215,31 @@ if args.wandb and master_process:
 
 def save_draft_checkpoint(path, draft_trainer_module, optimizer, loader, step, target_config, draft_config, target_ckpt_path):
     """Save a draft checkpoint with all state needed for resume."""
+    import subprocess
+    import os
+    
+    # Get git commit SHA for reproducibility
+    git_sha = "unknown"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], 
+            capture_output=True, text=True, cwd=os.path.dirname(path)
+        )
+        if result.returncode == 0:
+            git_sha = result.stdout.strip()
+    except:
+        pass
+    
+    # Extract step number from target checkpoint name
+    target_step = "unknown"
+    try:
+        import re
+        match = re.search(r'ckpt_(\d+)\.pt', str(target_ckpt_path))
+        if match:
+            target_step = int(match.group(1))
+    except:
+        pass
+    
     checkpoint = {
         "draft_trainer": draft_trainer_module.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -223,6 +248,9 @@ def save_draft_checkpoint(path, draft_trainer_module, optimizer, loader, step, t
         "target_config": asdict(target_config),
         "draft_config": asdict(draft_config),
         "target_checkpoint": str(target_ckpt_path),
+        "target_step": target_step,
+        "git_commit_sha": git_sha,
+        "creation_timestamp": time.time(),
     }
     torch.save(checkpoint, path)
 
@@ -231,9 +259,9 @@ def save_draft_checkpoint(path, draft_trainer_module, optimizer, loader, step, t
 def evaluate_draft(draft_trainer_module, target_model, loader, steps):
     """Evaluate draft on validation data and return mean loss + metrics."""
     draft_trainer_module.eval()
-    total_loss = 0.0
-    total_overlap = 0.0
-    total_agree = 0.0
+    total_loss = torch.zeros((), device=next(draft_trainer_module.parameters()).device)
+    total_overlap = torch.zeros((), device=next(draft_trainer_module.parameters()).device)
+    total_agree = torch.zeros((), device=next(draft_trainer_module.parameters()).device)
     actual_steps = 0
 
     for _ in range(steps):
@@ -251,17 +279,25 @@ def evaluate_draft(draft_trainer_module, target_model, loader, steps):
                 lm_head_fn=target_model.lm_head,
             )
 
-        total_loss += draft_result["loss"].item()
+        total_loss += draft_result["loss"].detach()
         if draft_result["per_step_overlap"]:
-            total_overlap += sum(draft_result["per_step_overlap"]) / len(draft_result["per_step_overlap"])
-            total_agree += sum(draft_result["per_step_agreement"]) / len(draft_result["per_step_agreement"])
+            step_overlap = sum(draft_result["per_step_overlap"]) / len(draft_result["per_step_overlap"])
+            step_agree = sum(draft_result["per_step_agreement"]) / len(draft_result["per_step_agreement"])
+            total_overlap += step_overlap
+            total_agree += step_agree
         actual_steps += 1
 
     if actual_steps == 0:
+        draft_trainer_module.train()
         return 0.0, 0.0, 0.0
 
+    # All-reduce across DDP ranks
+    avg_loss = all_reduce_mean(total_loss / actual_steps).item()
+    avg_overlap = all_reduce_mean(total_overlap / actual_steps).item() 
+    avg_agree = all_reduce_mean(total_agree / actual_steps).item()
+
     draft_trainer_module.train()
-    return total_loss / actual_steps, total_overlap / actual_steps, total_agree / actual_steps
+    return avg_loss, avg_overlap, avg_agree
 
 
 # --- Training loop ---
@@ -301,6 +337,7 @@ while True:
     accum_loss = torch.zeros((), device=device)
     accum_per_step_overlap = []
     accum_per_step_agree = []
+    step_counts = {}
 
     for micro_step in range(grad_accum_steps):
         inputs, targets = next(train_loader)
@@ -327,9 +364,23 @@ while True:
         loss.backward()
         accum_loss += loss.detach()
 
-        if micro_step == grad_accum_steps - 1:
-            accum_per_step_overlap = draft_result["per_step_overlap"]
-            accum_per_step_agree = draft_result["per_step_agreement"]
+        # Accumulate per-step metrics across all microsteps
+        if draft_result["per_step_overlap"]:
+            if not accum_per_step_overlap:
+                accum_per_step_overlap = [0.0] * len(draft_result["per_step_overlap"])
+                accum_per_step_agree = [0.0] * len(draft_result["per_step_agreement"])
+            
+            for i, (ov, ag) in enumerate(zip(draft_result["per_step_overlap"], draft_result["per_step_agreement"])):
+                accum_per_step_overlap[i] += ov
+                accum_per_step_agree[i] += ag
+                step_counts[i] = step_counts.get(i, 0) + 1
+
+    # Average per-step metrics across microsteps
+    if accum_per_step_overlap:
+        for i in range(len(accum_per_step_overlap)):
+            if step_counts.get(i, 0) > 0:
+                accum_per_step_overlap[i] /= step_counts[i]
+                accum_per_step_agree[i] /= step_counts[i]
 
     # Optimizer step
     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)

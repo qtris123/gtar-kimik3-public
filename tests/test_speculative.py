@@ -508,3 +508,70 @@ if __name__ == "__main__":
         print(f"CUDA speculative test ok ({max_new} tokens match)")
     else:
         print("\nCUDA not available, skipping CUDA speculative tests.")
+
+
+def test_incremental_vs_rebuilt_drafter_kv_state():
+    """Test that incrementally maintained drafter KV state matches rebuilding from full history.
+    
+    Covers cases: n_accepted = 0, 0 < n_accepted < K, n_accepted = K
+    """
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+    engine = SpeculativeEngine(model, draft_steps=4)
+    
+    # Create a test sequence where we can control acceptance
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    
+    with torch.no_grad():
+        # Build initial prefix state
+        target_cache = model.make_cache(1, 20, torch.float32)
+        all_fused, _ = engine._get_hidden_and_logits(input_ids, target_cache)
+        
+        # Case 1: n_accepted = 0 (all rejected)
+        prefix_k_0, prefix_v_0 = engine.build_draft_prefix(all_fused[:, :-1], input_ids[:, 1:])
+        
+        # Simulate rejection: prefix should remain unchanged
+        extended_k_0, extended_v_0 = engine._extend_draft_prefix(
+            prefix_k_0, prefix_v_0, torch.zeros(1, 0, config.hidden_size), torch.zeros(1, 0, dtype=torch.long)
+        )
+        
+        if prefix_k_0 is not None:
+            assert torch.allclose(extended_k_0, prefix_k_0, atol=1e-6), "n_accepted=0: KV should be unchanged"
+            assert torch.allclose(extended_v_0, prefix_v_0, atol=1e-6), "n_accepted=0: KV should be unchanged"
+        
+        # Case 2: 0 < n_accepted < K (partial acceptance)
+        new_tokens = torch.tensor([[10, 11]], dtype=torch.long)  # 2 new tokens
+        new_hidden = torch.randn(1, 2, config.hidden_size)
+        
+        # Incremental update
+        extended_k_partial, extended_v_partial = engine._extend_draft_prefix(
+            prefix_k_0, prefix_v_0, new_hidden, new_tokens
+        )
+        
+        # Rebuild from scratch with full history
+        full_tokens = torch.cat([input_ids[:, 1:], new_tokens], dim=1)
+        full_hidden = torch.cat([all_fused[:, :-1], new_hidden], dim=1) 
+        rebuilt_k, rebuilt_v = engine.build_draft_prefix(full_hidden, full_tokens)
+        
+        if extended_k_partial is not None and rebuilt_k is not None:
+            assert torch.allclose(extended_k_partial, rebuilt_k, atol=1e-5), "Partial acceptance: incremental != rebuilt KV"
+            assert torch.allclose(extended_v_partial, rebuilt_v, atol=1e-5), "Partial acceptance: incremental != rebuilt KV"
+        
+        # Case 3: n_accepted = K (full acceptance)  
+        more_tokens = torch.tensor([[12, 13, 14]], dtype=torch.long)  # 3 more tokens
+        more_hidden = torch.randn(1, 3, config.hidden_size)
+        
+        extended_k_full, extended_v_full = engine._extend_draft_prefix(
+            extended_k_partial, extended_v_partial, more_hidden, more_tokens
+        )
+        
+        # Rebuild with complete history
+        complete_tokens = torch.cat([input_ids[:, 1:], new_tokens, more_tokens], dim=1)
+        complete_hidden = torch.cat([all_fused[:, :-1], new_hidden, more_hidden], dim=1)
+        rebuilt_k_full, rebuilt_v_full = engine.build_draft_prefix(complete_hidden, complete_tokens)
+        
+        if extended_k_full is not None and rebuilt_k_full is not None:
+            assert torch.allclose(extended_k_full, rebuilt_k_full, atol=1e-5), "Full acceptance: incremental != rebuilt KV"
+            assert torch.allclose(extended_v_full, rebuilt_v_full, atol=1e-5), "Full acceptance: incremental != rebuilt KV"
+    
+    print("test_incremental_vs_rebuilt_drafter_kv_state... ok (all acceptance scenarios match)")

@@ -243,6 +243,8 @@ class SpeculativeEngine:
         total_accepted = 0
         per_step_proposed = [0] * self.draft_steps
         per_step_accepted = [0] * self.draft_steps
+        # Cumulative prefix acceptance: P(A1), P(A1∩A2), P(A1∩A2∩A3), etc.
+        cumulative_prefix_accepted = [0] * self.draft_steps
 
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == "cuda"):
             # --- Prefill: run the full prompt through the target ---
@@ -373,6 +375,11 @@ class SpeculativeEngine:
                     per_step_proposed[i] += 1
                 for i in range(n_accepted):
                     per_step_accepted[i] += 1
+                
+                # Track cumulative prefix acceptance
+                for i in range(min(K, self.draft_steps)):
+                    if n_accepted > i:  # At least i+1 tokens accepted (prefix of length i+1)
+                        cumulative_prefix_accepted[i] += 1
 
                 if eos_in_accepted:
                     # One of the accepted draft tokens is EOS
@@ -473,6 +480,15 @@ class SpeculativeEngine:
                 ],
                 "per_step_proposed": per_step_proposed,
                 "per_step_accepted": per_step_accepted,
+                # Cumulative prefix acceptance probabilities: P(A1), P(A1∩A2), etc.
+                "cumulative_prefix_acceptance": [
+                    cumulative_prefix_accepted[i] / max(1, num_rounds)
+                    for i in range(self.draft_steps)
+                ],
+                "expected_accepted_per_verification": sum(
+                    cumulative_prefix_accepted[i] / max(1, num_rounds)
+                    for i in range(self.draft_steps)
+                ),
                 "total_tokens_generated": result.shape[1],
             }
             return result, stats

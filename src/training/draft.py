@@ -42,7 +42,7 @@ class DraftConfig:
     lk_eps: float = 1e-8
     # Step loss weighting: 'uniform' or 'decay'
     step_loss_weighting: str = "uniform"
-    step_loss_decay: float = 0.9  # Per-step decay factor when weighting='decay'
+    step_loss_decay: float = 0.8  # Per-step decay factor when weighting='decay' (NVIDIA EAGLE-3 default)
 
 
 class FeatureProjection(nn.Module):
@@ -105,7 +105,15 @@ def lk_loss(
     p = torch.softmax(target_logits.float(), dim=-1).detach()  # target probs, no grad
     q = torch.softmax(draft_logits.float(), dim=-1)
     overlap = torch.minimum(p, q).sum(dim=-1)  # (B, T)
-    per_position_loss = -torch.log(overlap.clamp_min(eps))  # (B, T)
+    
+    # More numerically stable: handle exact zeros explicitly
+    # When overlap is exactly 0, set loss to a large finite value instead of inf
+    zero_overlap = overlap == 0.0
+    overlap_safe = torch.where(zero_overlap, eps, overlap)
+    per_position_loss = -torch.log(overlap_safe)  # (B, T)
+    
+    # For zero overlaps, use a large but finite loss value
+    per_position_loss = torch.where(zero_overlap, -torch.log(torch.tensor(eps, device=overlap.device)), per_position_loss)
 
     # Masked mean
     mask_float = mask.float()
@@ -319,7 +327,7 @@ class DraftTrainer(nn.Module):
 
         res = {
             "loss": total_loss,
-            "per_step_loss": [l.item() if isinstance(l, torch.Tensor) else l for l in per_step_losses],
+            "per_step_loss": per_step_losses,  # Keep as tensors
             "per_step_overlap": per_step_overlaps,
             "per_step_agreement": per_step_agreements,
         }

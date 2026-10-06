@@ -6,8 +6,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
-TARGET_CKPT="${1:-out/kimi_k3_0.6B_mtp/ckpt_012000.pt}"
-shift || true
+if [ $# -eq 0 ]; then
+    echo "Error: Stage-1 checkpoint path required"
+    echo "Usage: bash scripts/train_draft_0.6B.sh <target_checkpoint_path>"
+    echo "Example: bash scripts/train_draft_0.6B.sh out/kimi_k3_0.6B_mtp/ckpt_012000.pt"
+    exit 1
+fi
+
+TARGET_CKPT="$1"
+shift
 
 unset NCCL_NET
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH//\/usr\/local\/gib\/lib64:/}"
