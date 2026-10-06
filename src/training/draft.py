@@ -284,15 +284,10 @@ class DraftTrainer(nn.Module):
             step_mask = (sup_targets != -100) & valid_tokens  # (B, T-step_r)
 
             # Compute LK loss for this step
-            if step_mask.any():
-                step_loss = lk_loss(sup_target_logits, draft_logits, step_mask, eps=cfg.lk_eps)
-                overlap, agreement = compute_overlap_and_agreement(
-                    sup_target_logits, draft_logits, step_mask
-                )
-            else:
-                step_loss = torch.zeros((), device=device)
-                zero = torch.zeros((), device=device)
-                overlap, agreement = zero, zero
+            step_loss = lk_loss(sup_target_logits, draft_logits, step_mask, eps=cfg.lk_eps)
+            overlap, agreement = compute_overlap_and_agreement(
+                sup_target_logits, draft_logits, step_mask
+            )
 
             per_step_losses.append(step_loss)
             per_step_overlaps.append(overlap)

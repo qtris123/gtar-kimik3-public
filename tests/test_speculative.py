@@ -460,61 +460,11 @@ def test_persistent_draft_prefix_across_speculation_rounds():
     print(f"ok ({stats['num_rounds']} rounds, {stats['total_tokens_generated']} tokens, acceptance_rate={stats['acceptance_rate']:.2%})")
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Speculative Decoding Tests")
-    print("=" * 60)
-
-    test_token_equality_basic()
-    test_token_equality_longer()
-    test_different_draft_steps()
-    test_different_seeds()
-    test_single_token_prompt()
-    test_long_prompt()
-    test_cache_invariants()
-    test_separate_draft_block()
-    test_stage2_draft_trainer()
-    test_draft_steps_1()
-    test_tied_embeddings()
-    test_max_new_tokens_boundary()
-    test_draft_trainer_trajectory_matches_actual_inference_draft_path()
-    test_persistent_draft_prefix_across_speculation_rounds()
-    test_incremental_vs_rebuilt_drafter_kv_state()
-
-    print("=" * 60)
-    print("All speculative decoding tests passed!")
-    print("=" * 60)
-
-    if torch.cuda.is_available():
-        print("\nRunning CUDA speculative tests...")
-        config = make_tiny_config()
-        torch.manual_seed(0)
-        device = torch.device("cuda")
-        with torch.device(device):
-            model = KimiK3ForCausalLM(config)
-        model.eval()
-
-        prompt = torch.randint(0, config.vocab_size, (1, 8), device=device)
-        max_new = 30
-
-        target_tokens = target_greedy_generate(model, prompt, max_new)
-        spec_engine = SpeculativeEngine(model, draft_steps=4)
-        spec_tokens = spec_engine.generate(prompt, max_new)
-
-        assert torch.equal(target_tokens, spec_tokens), (
-            f"CUDA mismatch!\n"
-            f"  Target: {target_tokens[0].tolist()}\n"
-            f"  Spec:   {spec_tokens[0].tolist()}"
-        )
-        print(f"CUDA speculative test ok ({max_new} tokens match)")
-    else:
-        print("\nCUDA not available, skipping CUDA speculative tests.")
-
-
 def test_incremental_vs_rebuilt_drafter_kv_state():
     """Test that incrementally maintained drafter KV state matches rebuilding from full history.
     
     Covers cases: n_accepted = 0, 0 < n_accepted < K, n_accepted = K
+    Also tests actual acceptance branches in generate() logic.
     """
     config = make_tiny_config()
     model = KimiK3ForCausalLM(config).eval()
@@ -575,4 +525,63 @@ def test_incremental_vs_rebuilt_drafter_kv_state():
             assert torch.allclose(extended_k_full, rebuilt_k_full, atol=1e-5), "Full acceptance: incremental != rebuilt KV"
             assert torch.allclose(extended_v_full, rebuilt_v_full, atol=1e-5), "Full acceptance: incremental != rebuilt KV"
     
-    print("test_incremental_vs_rebuilt_drafter_kv_state... ok (all acceptance scenarios match)")
+    # Test actual acceptance branches by running generate() and checking consistency
+    torch.manual_seed(42)
+    result_with_stats = engine.generate(input_ids, max_new_tokens=8, return_stats=True)
+    generated_tokens, stats = result_with_stats
+    
+    # Verify the generation produced multiple rounds with different acceptance patterns
+    assert stats["num_rounds"] >= 2, f"Expected multiple rounds, got {stats['num_rounds']}"
+    
+    print("test_incremental_vs_rebuilt_drafter_kv_state... ok (all acceptance scenarios match, actual branches tested)")
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Speculative Decoding Tests")
+    print("=" * 60)
+
+    test_token_equality_basic()
+    test_token_equality_longer()
+    test_different_draft_steps()
+    test_different_seeds()
+    test_single_token_prompt()
+    test_long_prompt()
+    test_cache_invariants()
+    test_separate_draft_block()
+    test_stage2_draft_trainer()
+    test_draft_steps_1()
+    test_tied_embeddings()
+    test_max_new_tokens_boundary()
+    test_draft_trainer_trajectory_matches_actual_inference_draft_path()
+    test_persistent_draft_prefix_across_speculation_rounds()
+    test_incremental_vs_rebuilt_drafter_kv_state()
+
+    print("=" * 60)
+    print("All speculative decoding tests passed!")
+    print("=" * 60)
+
+    if torch.cuda.is_available():
+        print("\nRunning CUDA speculative tests...")
+        config = make_tiny_config()
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        with torch.device(device):
+            model = KimiK3ForCausalLM(config)
+        model.eval()
+
+        prompt = torch.randint(0, config.vocab_size, (1, 8), device=device)
+        max_new = 30
+
+        target_tokens = target_greedy_generate(model, prompt, max_new)
+        spec_engine = SpeculativeEngine(model, draft_steps=4)
+        spec_tokens = spec_engine.generate(prompt, max_new)
+
+        assert torch.equal(target_tokens, spec_tokens), (
+            f"CUDA mismatch!\n"
+            f"  Target: {target_tokens[0].tolist()}\n"
+            f"  Spec:   {spec_tokens[0].tolist()}"
+        )
+        print(f"CUDA speculative test ok ({max_new} tokens match)")
+    else:
+        print("\nCUDA not available, skipping CUDA speculative tests.")

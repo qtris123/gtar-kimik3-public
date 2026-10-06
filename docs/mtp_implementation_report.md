@@ -108,6 +108,11 @@ Executed via `/home/gpuuser/.venv/bin/python`:
    - `test_ttt_attention_history_maintained`: **PASSED** (verifies depth 2 depends directly on depth 1 attention state)
    - `test_ttt_no_future_leakage`: **PASSED** (verifies future token perturbations do not alter past anchor hidden states or logits)
    - `test_draft_trainer_trajectory_matches_actual_inference_draft_path`: **PASSED** (verifies DraftTrainer vectorized trajectory matches actual SpeculativeEngine inference draft path across depths $r \in \{1, 2, 3, 4\}$ and anchors $t \in \{0, 1, 3, 5\}$, max diff: 0.00e+00)
+   - `test_compile_compatibility`: **PASSED** (verifies compiled forward with no data-dependent Python branches)
+3. `tests/test_speculative.py` (Full 15-test speculative suite):
+   - 15/15 tests **PASSED**, including `test_persistent_draft_prefix_across_speculation_rounds` and `test_incremental_vs_rebuilt_drafter_kv_state` verifying incremental vs rebuilt drafter prefix KV across full, partial, and zero acceptance scenarios.
+
+**Total Test Suite Result**: 47 / 47 tests passed in `pytest tests/`.
 
 ### End-to-End Smoke Training Runs
 1. **Stage 1 Training (`scripts/train.py`)**:
