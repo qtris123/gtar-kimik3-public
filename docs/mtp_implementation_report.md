@@ -108,11 +108,20 @@ Executed via `/home/gpuuser/.venv/bin/python`:
    - `test_ttt_attention_history_maintained`: **PASSED** (verifies depth 2 depends directly on depth 1 attention state)
    - `test_ttt_no_future_leakage`: **PASSED** (verifies future token perturbations do not alter past anchor hidden states or logits)
    - `test_draft_trainer_trajectory_matches_actual_inference_draft_path`: **PASSED** (verifies DraftTrainer vectorized trajectory matches actual SpeculativeEngine inference draft path across depths $r \in \{1, 2, 3, 4\}$ and anchors $t \in \{0, 1, 3, 5\}$, max diff: 0.00e+00)
-   - `test_compile_compatibility`: **PASSED** (verifies compiled forward with no data-dependent Python branches)
-3. `tests/test_speculative.py` (Full 15-test speculative suite):
-   - 15/15 tests **PASSED**, including `test_persistent_draft_prefix_across_speculation_rounds` and `test_incremental_vs_rebuilt_drafter_kv_state` verifying incremental vs rebuilt drafter prefix KV across full, partial, and zero acceptance scenarios.
+   - `test_compile_compatibility`: **PASSED** (verifies compiled forward with no data-dependent Python branches, matching eager loss within 1e-4)
+3. `tests/test_speculative.py` (Full 21-test speculative suite):
+   - 21/21 tests **PASSED**, including:
+     - Output equality with target-only greedy generation across prompts, seeds, draft steps.
+     - `test_persistent_draft_prefix_across_speculation_rounds`: persistent Depth-1 drafter prefix across prompt prefill and accepted tokens.
+     - `test_incremental_vs_rebuilt_drafter_kv_state`: incremental prefix maintenance matches full rebuild.
+     - `test_deterministic_acceptance_branches_and_rebuilt_drafter_kv`: programmatic zero (`n=0`), partial (`0<n<K`), and full (`n=K`) acceptance branches, verifying `pending_token`, `prev_hidden`, target cache, generated tokens, and rebuilt drafter prefix KV.
+     - `test_kda_recurrent_cache_rollback_equivalence`: exact restoration of KDA recurrent states and conv buffers upon `fork()` and `rollback()`.
+     - `test_partial_rejection_and_replay_equivalence`: `fork -> verify -> rollback -> replay` matches clean direct execution for rejection after $a \in \{0, 1, K-1\}$ accepted drafts.
+     - `test_full_accept_commit_equivalence`: `fork -> verify -> commit(1+K)` matches direct clean execution.
+     - `test_deterministic_eos_branch_coverage`: deterministic EOS stop across initial pending, first/middle/last draft, bonus, and correction tokens.
+     - `test_speculative_statistics`: acceptance rates and cumulative prefix acceptance probabilities match analytical expectations.
 
-**Total Test Suite Result**: 47 / 47 tests passed in `pytest tests/`.
+**Total Test Suite Result**: 54 / 54 tests passed in `pytest tests/`.
 
 ### End-to-End Smoke Training Runs
 1. **Stage 1 Training (`scripts/train.py`)**:

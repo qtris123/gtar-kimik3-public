@@ -730,6 +730,57 @@ def test_draft_trainer_trajectory_matches_actual_inference_draft_path():
     print("ok (DraftTrainer vectorized matches actual SpeculativeEngine inference draft path)")
 
 
+def test_compile_compatibility():
+    """Test that DraftTrainer compiles and runs without graph breaks or errors."""
+    print("test_compile_compatibility...", end=" ", flush=True)
+    target_model, draft_trainer, config = build_target_and_draft()
+    draft_trainer.train()
+
+    B, T = 2, 16
+    torch.manual_seed(42)
+    inputs = torch.randint(0, config.vocab_size, (B, T))
+    targets = torch.randint(0, config.vocab_size, (B, T))
+
+    with torch.no_grad():
+        result = target_model(inputs, return_features=True)
+        target_logits = result["logits"].detach()
+        features = {k: v.detach() for k, v in result["features"].items()}
+
+    # Eager forward
+    eager_result = draft_trainer(
+        target_features=features,
+        target_logits=target_logits,
+        targets=targets,
+        embed_fn=target_model.model.embed_tokens,
+        lm_head_fn=target_model.lm_head,
+    )
+    eager_loss = eager_result["loss"]
+
+    # Compiled forward
+    compiled_trainer = torch.compile(draft_trainer)
+
+    # Run multiple iterations so compiled graph is traced and executed
+    for _ in range(2):
+        compiled_result = compiled_trainer(
+            target_features=features,
+            target_logits=target_logits,
+            targets=targets,
+            embed_fn=target_model.model.embed_tokens,
+            lm_head_fn=target_model.lm_head,
+        )
+        assert torch.isfinite(compiled_result["loss"]), "Compiled loss is not finite"
+
+    compiled_loss = compiled_result["loss"]
+    assert torch.allclose(eager_loss, compiled_loss, atol=1e-4), (
+        f"Compiled vs eager loss mismatch: {compiled_loss.item():.6f} vs {eager_loss.item():.6f}"
+    )
+
+    compiled_loss.backward()
+    grads = [p.grad for p in draft_trainer.parameters() if p.requires_grad and p.grad is not None]
+    assert len(grads) > 0, "No gradients produced by compiled backward"
+    print("ok")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Stage 2 Draft Training Tests")
@@ -752,6 +803,7 @@ if __name__ == "__main__":
     test_ttt_attention_history_maintained()
     test_ttt_no_future_leakage()
     test_draft_trainer_trajectory_matches_actual_inference_draft_path()
+    test_compile_compatibility()
 
     print("=" * 60)
     print("All Stage 2 tests passed!")

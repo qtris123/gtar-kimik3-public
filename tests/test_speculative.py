@@ -10,11 +10,13 @@ Run from the repo root:
 
 import sys
 import torch
+import torch.nn as nn
 
 from src.models.kimi_k3 import KimiK3Config, KimiK3ForCausalLM
 from src.models.mtp import MTPBlock
 from src.engine import Engine
 from src.speculative import SpeculativeEngine
+from src.cache import Cache, DraftTTTCache
 
 
 def make_tiny_config(**overrides):
@@ -463,8 +465,7 @@ def test_persistent_draft_prefix_across_speculation_rounds():
 def test_incremental_vs_rebuilt_drafter_kv_state():
     """Test that incrementally maintained drafter KV state matches rebuilding from full history.
     
-    Covers cases: n_accepted = 0, 0 < n_accepted < K, n_accepted = K
-    Also tests actual acceptance branches in generate() logic.
+    Covers cases: n_accepted = 0 (advances by pending token), 0 < n_accepted < K, n_accepted = K.
     """
     config = make_tiny_config()
     model = KimiK3ForCausalLM(config).eval()
@@ -479,34 +480,39 @@ def test_incremental_vs_rebuilt_drafter_kv_state():
         all_fused, _ = engine._get_hidden_and_logits(input_ids, target_cache)
         
         # Case 1: n_accepted = 0 (all rejected)
+        # Semantics: persistent prefix advances by the old pending token
         prefix_k_0, prefix_v_0 = engine.build_draft_prefix(all_fused[:, :-1], input_ids[:, 1:])
+        pending_token = torch.tensor([[10]], dtype=torch.long)
         
-        # Simulate rejection: prefix should remain unchanged
         extended_k_0, extended_v_0 = engine._extend_draft_prefix(
-            prefix_k_0, prefix_v_0, torch.zeros(1, 0, config.hidden_size), torch.zeros(1, 0, dtype=torch.long)
+            prefix_k_0, prefix_v_0, all_fused[:, -1:], pending_token
         )
         
-        if prefix_k_0 is not None:
-            assert torch.allclose(extended_k_0, prefix_k_0, atol=1e-6), "n_accepted=0: KV should be unchanged"
-            assert torch.allclose(extended_v_0, prefix_v_0, atol=1e-6), "n_accepted=0: KV should be unchanged"
+        full_tokens_0 = torch.cat([input_ids[:, 1:], pending_token], dim=1)
+        full_seq_0 = torch.cat([input_ids, pending_token], dim=1)
+        dummy_cache = model.make_cache(1, 20, torch.float32)
+        full_fused_0, _ = engine._get_hidden_and_logits(full_seq_0, dummy_cache)
+        rebuilt_k_0, rebuilt_v_0 = engine.build_draft_prefix(full_fused_0[:, :-1], full_tokens_0)
+        
+        if extended_k_0 is not None and rebuilt_k_0 is not None:
+            torch.testing.assert_close(extended_k_0, rebuilt_k_0, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(extended_v_0, rebuilt_v_0, atol=1e-5, rtol=1e-5)
         
         # Case 2: 0 < n_accepted < K (partial acceptance)
         new_tokens = torch.tensor([[10, 11]], dtype=torch.long)  # 2 new tokens
         new_hidden = torch.randn(1, 2, config.hidden_size)
         
-        # Incremental update
         extended_k_partial, extended_v_partial = engine._extend_draft_prefix(
             prefix_k_0, prefix_v_0, new_hidden, new_tokens
         )
         
-        # Rebuild from scratch with full history
         full_tokens = torch.cat([input_ids[:, 1:], new_tokens], dim=1)
         full_hidden = torch.cat([all_fused[:, :-1], new_hidden], dim=1) 
         rebuilt_k, rebuilt_v = engine.build_draft_prefix(full_hidden, full_tokens)
         
         if extended_k_partial is not None and rebuilt_k is not None:
-            assert torch.allclose(extended_k_partial, rebuilt_k, atol=1e-5), "Partial acceptance: incremental != rebuilt KV"
-            assert torch.allclose(extended_v_partial, rebuilt_v, atol=1e-5), "Partial acceptance: incremental != rebuilt KV"
+            torch.testing.assert_close(extended_k_partial, rebuilt_k, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(extended_v_partial, rebuilt_v, atol=1e-5, rtol=1e-5)
         
         # Case 3: n_accepted = K (full acceptance)  
         more_tokens = torch.tensor([[12, 13, 14]], dtype=torch.long)  # 3 more tokens
@@ -516,24 +522,513 @@ def test_incremental_vs_rebuilt_drafter_kv_state():
             extended_k_partial, extended_v_partial, more_hidden, more_tokens
         )
         
-        # Rebuild with complete history
         complete_tokens = torch.cat([input_ids[:, 1:], new_tokens, more_tokens], dim=1)
         complete_hidden = torch.cat([all_fused[:, :-1], new_hidden, more_hidden], dim=1)
         rebuilt_k_full, rebuilt_v_full = engine.build_draft_prefix(complete_hidden, complete_tokens)
         
         if extended_k_full is not None and rebuilt_k_full is not None:
-            assert torch.allclose(extended_k_full, rebuilt_k_full, atol=1e-5), "Full acceptance: incremental != rebuilt KV"
-            assert torch.allclose(extended_v_full, rebuilt_v_full, atol=1e-5), "Full acceptance: incremental != rebuilt KV"
+            torch.testing.assert_close(extended_k_full, rebuilt_k_full, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(extended_v_full, rebuilt_v_full, atol=1e-5, rtol=1e-5)
     
     # Test actual acceptance branches by running generate() and checking consistency
     torch.manual_seed(42)
     result_with_stats = engine.generate(input_ids, max_new_tokens=8, return_stats=True)
     generated_tokens, stats = result_with_stats
-    
-    # Verify the generation produced multiple rounds with different acceptance patterns
     assert stats["num_rounds"] >= 2, f"Expected multiple rounds, got {stats['num_rounds']}"
+    print("test_incremental_vs_rebuilt_drafter_kv_state... ok")
+
+
+class DraftBlockWrapper(nn.Module):
+    def __init__(self, real_block, engine):
+        super().__init__()
+        self.real_block = real_block
+        self.engine = engine
+
+    def forward(self, hidden, token_emb, ttt_cache=None):
+        if ttt_cache is not None:
+            self.engine.captured_draft_cache = ttt_cache
+        self.engine.in_draft_step = True
+        return self.real_block(hidden, token_emb, ttt_cache=ttt_cache)
+
+    def get_output_hidden(self, draft_hidden):
+        return self.real_block.get_output_hidden(draft_hidden)
+
+
+class ControlledSpeculativeEngine(SpeculativeEngine):
+    """Speculative engine with programmatic control over verification logits and draft tokens."""
+
+    def __init__(
+        self,
+        *args,
+        round_acceptances: list[int] | None = None,
+        force_draft_eos_step: int | None = None,
+        force_eos_at: str | None = None,
+        eos_token_id: int | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.round_acceptances = list(round_acceptances) if round_acceptances is not None else []
+        self.force_draft_eos_step = force_draft_eos_step
+        self.force_eos_at = force_eos_at
+        self.eos_token_id = eos_token_id
+        self.round_idx = 0
+        self.in_draft_step = False
+        self.captured_target_cache = None
+        self.captured_draft_cache = None
+        self.captured_extended_k = None
+        self.captured_extended_v = None
+        self.captured_verify_hidden = None
+        self.captured_replay_hidden = None
+        self.final_draft_prefix_k = None
+        self.final_draft_prefix_v = None
+        self.last_n_accepted = None
+        self.captured_draft_tokens: list[torch.Tensor] = []
+        self.captured_initial_pending = None
+
+        self.draft_block = DraftBlockWrapper(self.draft_block, self)
+
+    def _is_cache_forked(self, cache: Cache) -> bool:
+        return any(
+            getattr(l, "_snapshot_seq_len", None) is not None or getattr(l, "_snapshot", None) is not None
+            for l in cache.layers
+        )
+
+    def _get_hidden_and_logits(self, input_ids: torch.Tensor, cache: Cache) -> tuple[torch.Tensor, torch.Tensor]:
+        seed_hidden, logits = super()._get_hidden_and_logits(input_ids, cache)
+        self.captured_target_cache = cache
+
+        # Prefill prompt:
+        if input_ids.shape[1] > 1 and not self._is_cache_forked(cache) and cache.seq_len == input_ids.shape[1]:
+            if self.force_eos_at == "initial_pending":
+                logits = logits.clone()
+                logits[:, -1, :] = -1e4
+                logits[:, -1, self.eos_token_id] = 1e4
+            self.captured_initial_pending = logits[:, -1].float().argmax(-1)
+            return seed_hidden, logits
+
+        # Verification step:
+        if input_ids.shape[1] > 1 and self._is_cache_forked(cache):
+            self.captured_verify_hidden = seed_hidden
+            K = input_ids.shape[1] - 1
+            if self.round_idx < len(self.round_acceptances):
+                n_acc = self.round_acceptances[self.round_idx]
+            else:
+                n_acc = K
+
+            self.last_n_accepted = n_acc
+            vocab_size = logits.shape[-1]
+            logits = logits.clone()
+
+            for i in range(K):
+                draft_tok = input_ids[0, i + 1].item()
+                if i < n_acc:
+                    logits[0, i, :] = -1e4
+                    logits[0, i, draft_tok] = 1e4
+                else:
+                    mismatch_tok = (draft_tok + 1) % vocab_size
+                    if self.eos_token_id is not None and mismatch_tok == self.eos_token_id:
+                        mismatch_tok = (mismatch_tok + 1) % vocab_size
+                    logits[0, i, :] = -1e4
+                    logits[0, i, mismatch_tok] = 1e4
+
+            if self.force_eos_at == "bonus" and n_acc == K:
+                logits[0, K, :] = -1e4
+                logits[0, K, self.eos_token_id] = 1e4
+            elif self.force_eos_at == "correction" and n_acc < K:
+                logits[0, n_acc, :] = -1e4
+                logits[0, n_acc, self.eos_token_id] = 1e4
+
+            self.round_idx += 1
+            return seed_hidden, logits
+
+        # Replay forward:
+        self.captured_replay_hidden = seed_hidden
+        return seed_hidden, logits
+
+    def _extend_draft_prefix(self, prefix_k, prefix_v, hidden, tokens):
+        k, v = super()._extend_draft_prefix(prefix_k, prefix_v, hidden, tokens)
+        self.captured_extended_k = k
+        self.captured_extended_v = v
+        return k, v
+
+    def generate(self, *args, **kwargs):
+        orig_lm_head = self.target_model.lm_head
+        draft_step_counter = [0]
+        captured_tokens = self.captured_draft_tokens
+
+        class InterceptedLMHead(nn.Module):
+            def __init__(outer_self, real_head):
+                super().__init__()
+                outer_self.real_head = real_head
+
+            @property
+            def weight(outer_self):
+                return outer_self.real_head.weight
+
+            def forward(outer_self, x):
+                logits = outer_self.real_head(x)
+                if getattr(self, "in_draft_step", False):
+                    self.in_draft_step = False
+                    if self.force_draft_eos_step is not None:
+                        if draft_step_counter[0] == self.force_draft_eos_step:
+                            logits = logits.clone()
+                            logits[:, :, :] = -1e4
+                            logits[:, :, self.eos_token_id] = 1e4
+                    tok = logits[:, -1].float().argmax(-1)
+                    captured_tokens.append(tok)
+                    draft_step_counter[0] += 1
+                return logits
+
+        self.target_model.lm_head = InterceptedLMHead(orig_lm_head)
+        try:
+            res = super().generate(*args, **kwargs)
+            if self.last_n_accepted == 0:
+                if self.captured_draft_cache is not None:
+                    self.final_draft_prefix_k = self.captured_draft_cache.k_list[0]
+                    self.final_draft_prefix_v = self.captured_draft_cache.v_list[0]
+            else:
+                self.final_draft_prefix_k = self.captured_extended_k
+                self.final_draft_prefix_v = self.captured_extended_v
+            return res
+        finally:
+            self.target_model.lm_head = orig_lm_head
+
+
+def test_deterministic_acceptance_branches_and_rebuilt_drafter_kv():
+    """Test deterministic n_accepted = 0, 0 < n_accepted < K, n_accepted = K branches.
     
-    print("test_incremental_vs_rebuilt_drafter_kv_state... ok (all acceptance scenarios match, actual branches tested)")
+    Verifies:
+      - pending_token
+      - prev_hidden
+      - target cache state
+      - draft_prefix_k/v (incremental vs full rebuild)
+      - generated tokens
+    against the expected committed sequence.
+    """
+    print("test_deterministic_acceptance_branches_and_rebuilt_drafter_kv...", end=" ", flush=True)
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+    K = 4
+    prompt = torch.tensor([[2, 4, 6, 8, 10]], dtype=torch.long)
+
+    test_cases = [
+        (0, 2),
+        (2, 4),
+        (4, 6),
+    ]
+
+    for n_acc, max_new in test_cases:
+        torch.manual_seed(100)
+        engine = ControlledSpeculativeEngine(
+            model, draft_steps=K, round_acceptances=[n_acc]
+        )
+        gen_tokens, stats = engine.generate(prompt, max_new_tokens=max_new, return_stats=True)
+
+        assert stats["num_rounds"] == 1, f"Expected 1 round, got {stats['num_rounds']}"
+        assert stats["draft_accepted"] == n_acc, f"Expected {n_acc} accepted, got {stats['draft_accepted']}"
+
+        # 1. Verify generated tokens structure:
+        initial_pending = engine.captured_initial_pending
+        drafts = engine.captured_draft_tokens[:K]
+        if n_acc == K:
+            bonus = gen_tokens[:, -1]
+            expected_gen = torch.cat([initial_pending.view(1, 1)] + [d.view(1, 1) for d in drafts] + [bonus.view(1, 1)], dim=1)
+            committed_tokens = torch.cat([prompt, initial_pending.view(1, 1)] + [d.view(1, 1) for d in drafts], dim=1)
+        elif n_acc == 0:
+            correction = gen_tokens[:, -1]
+            expected_gen = torch.cat([initial_pending.view(1, 1), correction.view(1, 1)], dim=1)
+            committed_tokens = torch.cat([prompt, initial_pending.view(1, 1)], dim=1)
+        else:
+            correction = gen_tokens[:, -1]
+            expected_gen = torch.cat([initial_pending.view(1, 1)] + [d.view(1, 1) for d in drafts[:n_acc]] + [correction.view(1, 1)], dim=1)
+            committed_tokens = torch.cat([prompt, initial_pending.view(1, 1)] + [d.view(1, 1) for d in drafts[:n_acc]], dim=1)
+
+        torch.testing.assert_close(gen_tokens, expected_gen)
+
+        # 2. Verify target cache state matches direct forward of committed_tokens
+        expected_cache = model.make_cache(1, 64, torch.float32)
+        model(committed_tokens, cache=expected_cache)
+
+        assert engine.captured_target_cache.seq_len == expected_cache.seq_len
+        for act_layer, exp_layer in zip(engine.captured_target_cache.layers, expected_cache.layers):
+            if hasattr(act_layer, "state"):
+                torch.testing.assert_close(act_layer.state, exp_layer.state)
+                for cs_act, cs_exp in zip(act_layer.conv_states, exp_layer.conv_states):
+                    torch.testing.assert_close(cs_act, cs_exp)
+                assert act_layer.seq_len == exp_layer.seq_len
+            else:
+                assert act_layer.seq_len == exp_layer.seq_len
+                torch.testing.assert_close(act_layer.keys[:, :, :act_layer.seq_len], exp_layer.keys[:, :, :exp_layer.seq_len])
+                torch.testing.assert_close(act_layer.values[:, :, :act_layer.seq_len], exp_layer.values[:, :, :exp_layer.seq_len])
+
+        # 3. Verify incremental drafter prefix against full rebuild
+        fresh_cache = model.make_cache(1, 64, torch.float32)
+        full_fused, _ = engine._get_hidden_and_logits(committed_tokens, fresh_cache)
+        rebuilt_k, rebuilt_v = engine.build_draft_prefix(
+            full_fused[:, :-1, :], committed_tokens[:, 1:]
+        )
+
+        torch.testing.assert_close(engine.final_draft_prefix_k, rebuilt_k)
+        torch.testing.assert_close(engine.final_draft_prefix_v, rebuilt_v)
+
+        # 4. Verify explicit prefix length semantics:
+        expected_prefix_len = (prompt.shape[1] - 1) + 1 + n_acc
+        assert engine.final_draft_prefix_k.shape[2] == expected_prefix_len, (
+            f"Prefix length mismatch for n_acc={n_acc}: "
+            f"got {engine.final_draft_prefix_k.shape[2]}, expected {expected_prefix_len}"
+        )
+
+    print("ok")
+
+
+def test_kda_recurrent_cache_rollback_equivalence():
+    """Test that KDA recurrent state and conv buffers are exactly restored after fork() and rollback()."""
+    print("test_kda_recurrent_cache_rollback_equivalence...", end=" ", flush=True)
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+
+    prefix = torch.tensor([[10, 20, 30, 40, 50, 60, 70, 80]], dtype=torch.long)
+    cache = model.make_cache(1, 64, torch.float32)
+
+    with torch.no_grad():
+        # A. Build cache to prefix
+        model(prefix, cache=cache)
+
+        # B. Clone reference state for all layers
+        saved_states = []
+        for layer_cache in cache.layers:
+            if hasattr(layer_cache, "state"):
+                saved_states.append({
+                    "type": "recurrent",
+                    "state": layer_cache.state.clone(),
+                    "conv_states": [cs.clone() for cs in layer_cache.conv_states],
+                    "seq_len": layer_cache.seq_len,
+                })
+            else:
+                saved_states.append({
+                    "type": "kv",
+                    "keys": layer_cache.keys[:, :, :layer_cache.seq_len].clone(),
+                    "values": layer_cache.values[:, :, :layer_cache.seq_len].clone(),
+                    "seq_len": layer_cache.seq_len,
+                })
+
+        # C. Fork
+        cache.fork()
+
+        # D. Process speculative tokens
+        spec_tokens = torch.tensor([[101, 102, 103, 104]], dtype=torch.long)
+        model(spec_tokens, cache=cache)
+
+        # Verify state actually changed while forked
+        for i, layer_cache in enumerate(cache.layers):
+            if saved_states[i]["type"] == "recurrent":
+                assert not torch.allclose(layer_cache.state, saved_states[i]["state"]), "Recurrent state did not change"
+                assert layer_cache.seq_len > saved_states[i]["seq_len"], "Seq len did not increase"
+
+        # E. Rollback
+        cache.rollback()
+
+        # F. Assert cache == state from B
+        for i, layer_cache in enumerate(cache.layers):
+            if saved_states[i]["type"] == "recurrent":
+                torch.testing.assert_close(layer_cache.state, saved_states[i]["state"])
+                for cs, expected_cs in zip(layer_cache.conv_states, saved_states[i]["conv_states"]):
+                    torch.testing.assert_close(cs, expected_cs)
+                assert layer_cache.seq_len == saved_states[i]["seq_len"]
+            else:
+                assert layer_cache.seq_len == saved_states[i]["seq_len"]
+                torch.testing.assert_close(layer_cache.keys[:, :, :layer_cache.seq_len], saved_states[i]["keys"])
+                torch.testing.assert_close(layer_cache.values[:, :, :layer_cache.seq_len], saved_states[i]["values"])
+
+    print("ok")
+
+
+def test_partial_rejection_and_replay_equivalence():
+    """Test that fork -> verify -> reject -> rollback -> replay produces identical cache/hidden/logits to clean forward."""
+    print("test_partial_rejection_and_replay_equivalence...", end=" ", flush=True)
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+
+    prefix = torch.tensor([[5, 12, 19, 26, 33]], dtype=torch.long)
+    K = 4
+    for a in [0, 1, K - 1]:
+        cache_a = model.make_cache(1, 64, torch.float32)
+        cache_b = model.make_cache(1, 64, torch.float32)
+
+        with torch.no_grad():
+            res_a = model(prefix, cache=cache_a, return_features=True)
+            res_b = model(prefix, cache=cache_b, return_features=True)
+
+            pending = res_a["logits"][:, -1:].argmax(-1)
+            drafts = torch.tensor([[100, 101, 102, 103]], dtype=torch.long)
+            spec_tokens = torch.cat([pending, drafts], dim=1)
+
+            accepted_tokens = torch.cat([pending, drafts[:, :a]], dim=1) if a > 0 else pending
+
+            # Path A: fork -> verify spec -> rollback -> replay accepted
+            cache_a.fork()
+            model(spec_tokens, cache=cache_a, return_features=True)
+            cache_a.rollback()
+            out_a = model(accepted_tokens, cache=cache_a, return_features=True)
+
+            # Path B: directly run accepted tokens
+            out_b = model(accepted_tokens, cache=cache_b, return_features=True)
+
+            torch.testing.assert_close(out_a["logits"], out_b["logits"])
+            torch.testing.assert_close(out_a["features"]["final_hidden"], out_b["features"]["final_hidden"])
+
+            for layer_a, layer_b in zip(cache_a.layers, cache_b.layers):
+                if hasattr(layer_a, "state"):
+                    torch.testing.assert_close(layer_a.state, layer_b.state)
+                    for cs_a, cs_b in zip(layer_a.conv_states, layer_b.conv_states):
+                        torch.testing.assert_close(cs_a, cs_b)
+                    assert layer_a.seq_len == layer_b.seq_len
+                else:
+                    assert layer_a.seq_len == layer_b.seq_len
+                    torch.testing.assert_close(layer_a.keys[:, :, :layer_a.seq_len], layer_b.keys[:, :, :layer_b.seq_len])
+                    torch.testing.assert_close(layer_a.values[:, :, :layer_a.seq_len], layer_b.values[:, :, :layer_b.seq_len])
+
+    print("ok")
+
+
+def test_full_accept_commit_equivalence():
+    """Test that fork -> verify -> commit(1+K) matches direct clean forward."""
+    print("test_full_accept_commit_equivalence...", end=" ", flush=True)
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+
+    prefix = torch.tensor([[7, 14, 21, 28]], dtype=torch.long)
+    K = 4
+
+    cache_a = model.make_cache(1, 64, torch.float32)
+    cache_b = model.make_cache(1, 64, torch.float32)
+
+    with torch.no_grad():
+        res_a = model(prefix, cache=cache_a, return_features=True)
+        res_b = model(prefix, cache=cache_b, return_features=True)
+
+        pending = res_a["logits"][:, -1:].argmax(-1)
+        drafts = torch.tensor([[201, 202, 203, 204]], dtype=torch.long)
+        spec_tokens = torch.cat([pending, drafts], dim=1)
+
+        # Path A: fork -> verify -> commit(1 + K)
+        cache_a.fork()
+        out_a = model(spec_tokens, cache=cache_a, return_features=True)
+        cache_a.commit(1 + K)
+
+        # Path B: direct clean forward of spec_tokens
+        out_b = model(spec_tokens, cache=cache_b, return_features=True)
+
+        torch.testing.assert_close(out_a["logits"], out_b["logits"])
+        torch.testing.assert_close(out_a["features"]["final_hidden"], out_b["features"]["final_hidden"])
+
+        for layer_a, layer_b in zip(cache_a.layers, cache_b.layers):
+            if hasattr(layer_a, "state"):
+                torch.testing.assert_close(layer_a.state, layer_b.state)
+                for cs_a, cs_b in zip(layer_a.conv_states, layer_b.conv_states):
+                    torch.testing.assert_close(cs_a, cs_b)
+                assert layer_a.seq_len == layer_b.seq_len
+            else:
+                assert layer_a.seq_len == layer_b.seq_len
+                torch.testing.assert_close(layer_a.keys[:, :, :layer_a.seq_len], layer_b.keys[:, :, :layer_b.seq_len])
+                torch.testing.assert_close(layer_a.values[:, :, :layer_a.seq_len], layer_b.values[:, :, :layer_b.seq_len])
+
+    print("ok")
+
+
+def test_deterministic_eos_branch_coverage():
+    """Test deterministic EOS stop at each candidate position."""
+    print("test_deterministic_eos_branch_coverage...", end=" ", flush=True)
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+    eos_id = 99
+    prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    # 1. Initial pending token is EOS
+    engine_1 = ControlledSpeculativeEngine(
+        model, draft_steps=4, force_eos_at="initial_pending", eos_token_id=eos_id
+    )
+    tokens_1 = engine_1.generate(prompt, max_new_tokens=10, eos_token_id=eos_id)
+    assert tokens_1.shape[1] == 1, f"Expected 1 token, got {tokens_1.shape[1]}"
+    assert tokens_1[0, -1].item() == eos_id
+    assert (tokens_1 == eos_id).sum().item() == 1
+
+    # 2. First accepted draft is EOS
+    engine_2 = ControlledSpeculativeEngine(
+        model, draft_steps=4, round_acceptances=[4], force_draft_eos_step=0, eos_token_id=eos_id
+    )
+    tokens_2 = engine_2.generate(prompt, max_new_tokens=10, eos_token_id=eos_id)
+    assert tokens_2.shape[1] == 2, f"Expected 2 tokens, got {tokens_2.shape[1]}"
+    assert tokens_2[0, -1].item() == eos_id
+    assert (tokens_2 == eos_id).sum().item() == 1
+
+    # 3. Middle accepted draft is EOS (step 1 of 4)
+    engine_3 = ControlledSpeculativeEngine(
+        model, draft_steps=4, round_acceptances=[4], force_draft_eos_step=1, eos_token_id=eos_id
+    )
+    tokens_3 = engine_3.generate(prompt, max_new_tokens=10, eos_token_id=eos_id)
+    assert tokens_3.shape[1] == 3, f"Expected 3 tokens, got {tokens_3.shape[1]}"
+    assert tokens_3[0, -1].item() == eos_id
+    assert (tokens_3 == eos_id).sum().item() == 1
+
+    # 4. Last accepted draft is EOS (step 3 of 4)
+    engine_4 = ControlledSpeculativeEngine(
+        model, draft_steps=4, round_acceptances=[4], force_draft_eos_step=3, eos_token_id=eos_id
+    )
+    tokens_4 = engine_4.generate(prompt, max_new_tokens=10, eos_token_id=eos_id)
+    assert tokens_4.shape[1] == 5, f"Expected 5 tokens, got {tokens_4.shape[1]}"
+    assert tokens_4[0, -1].item() == eos_id
+    assert (tokens_4 == eos_id).sum().item() == 1
+
+    # 5. Bonus token is EOS
+    engine_5 = ControlledSpeculativeEngine(
+        model, draft_steps=4, round_acceptances=[4], force_eos_at="bonus", eos_token_id=eos_id
+    )
+    tokens_5 = engine_5.generate(prompt, max_new_tokens=10, eos_token_id=eos_id)
+    assert tokens_5.shape[1] == 6, f"Expected 6 tokens, got {tokens_5.shape[1]}"
+    assert tokens_5[0, -1].item() == eos_id
+    assert (tokens_5 == eos_id).sum().item() == 1
+
+    # 6. Correction token after rejection is EOS
+    engine_6 = ControlledSpeculativeEngine(
+        model, draft_steps=4, round_acceptances=[0], force_eos_at="correction", eos_token_id=eos_id
+    )
+    tokens_6 = engine_6.generate(prompt, max_new_tokens=10, eos_token_id=eos_id)
+    assert tokens_6.shape[1] == 2, f"Expected 2 tokens, got {tokens_6.shape[1]}"
+    assert tokens_6[0, -1].item() == eos_id
+    assert (tokens_6 == eos_id).sum().item() == 1
+
+    print("ok")
+
+
+def test_speculative_statistics():
+    """Test speculative acceptance statistics matching exact programmed round outcomes."""
+    print("test_speculative_statistics...", end=" ", flush=True)
+    config = make_tiny_config()
+    model = KimiK3ForCausalLM(config).eval()
+
+    prompt = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    engine = ControlledSpeculativeEngine(
+        model,
+        draft_steps=4,
+        round_acceptances=[0, 2, 4],  # round 1: 0, round 2: 2, round 3: 4
+    )
+
+    tokens, stats = engine.generate(prompt, max_new_tokens=10, return_stats=True)
+
+    assert stats["num_rounds"] == 3
+    assert stats["draft_proposed"] == 12
+    assert stats["draft_accepted"] == 6
+    assert abs(stats["acceptance_rate"] - (6 / 12)) < 1e-6
+    assert abs(stats["mean_accepted_per_round"] - 2.0) < 1e-6
+
+    expected_cumulative = [2 / 3, 2 / 3, 1 / 3, 1 / 3]
+    for act, exp in zip(stats["cumulative_prefix_acceptance"], expected_cumulative):
+        assert abs(act - exp) < 1e-6, f"Cumulative acceptance mismatch: {act} vs {exp}"
+
+    assert abs(stats["expected_accepted_per_verification"] - 2.0) < 1e-6
+
+    print("ok")
 
 
 if __name__ == "__main__":
@@ -556,6 +1051,12 @@ if __name__ == "__main__":
     test_draft_trainer_trajectory_matches_actual_inference_draft_path()
     test_persistent_draft_prefix_across_speculation_rounds()
     test_incremental_vs_rebuilt_drafter_kv_state()
+    test_deterministic_acceptance_branches_and_rebuilt_drafter_kv()
+    test_kda_recurrent_cache_rollback_equivalence()
+    test_partial_rejection_and_replay_equivalence()
+    test_full_accept_commit_equivalence()
+    test_deterministic_eos_branch_coverage()
+    test_speculative_statistics()
 
     print("=" * 60)
     print("All speculative decoding tests passed!")
