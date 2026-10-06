@@ -139,15 +139,19 @@ class DraftTTTCache:
     ):
         self.k_list: list[torch.Tensor] = []
         self.v_list: list[torch.Tensor] = []
+        self.prefix_k = prefix_k
+        self.prefix_v = prefix_v
         self.mode = mode
         self._snapshot_len: int | None = None
-        if prefix_k is not None and prefix_v is not None:
-            self.k_list.append(prefix_k)
-            self.v_list.append(prefix_v)
 
     def append(self, k: torch.Tensor, v: torch.Tensor) -> None:
-        self.k_list.append(k)
-        self.v_list.append(v)
+        if len(self.k_list) == 0 and self.prefix_k is not None and self.prefix_v is not None:
+            # Step 1: concatenate persistent prefix with current anchor's key/value
+            self.k_list.append(torch.cat([self.prefix_k, k], dim=2))
+            self.v_list.append(torch.cat([self.prefix_v, v], dim=2))
+        else:
+            self.k_list.append(k)
+            self.v_list.append(v)
 
     @property
     def step_count(self) -> int:

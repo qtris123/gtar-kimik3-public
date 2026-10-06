@@ -105,7 +105,7 @@ If the target is ambiguous, use `tmux list-panes -a` to identify its pane ID and
 Keep this documented as follow-on work, separate from the training deliverable.
 
 - [x] Begin with greedy speculative decoding at **inference batch size 1**; ordinary training can remain batched. Require token-for-token equality with target-only greedy generation in `test_speculative.py`.
-- [x] Define pending-token/cache-length invariants and add transactional fork/commit. KV buffers can share unused future slots; clone KDA state and convolution buffers. On rejection, discard shadow state and replay only the pending token plus accepted prefix. Reset/rebuild draft state too; reducing `seq_len` cannot undo recurrent updates.
+- [x] Define pending-token/cache-length invariants and add transactional fork/commit. KV buffers can share unused future slots; clone KDA state and convolution buffers. On rejection, discard shadow state and replay only the pending token plus accepted prefix. Reset/rebuild draft state too; reducing `seq_len` cannot undo recurrent updates. Speculative inference maintains persistent Depth-1 drafter prefix across prompt prefill and accepted tokens/rounds via `DraftTTTCache`, verified to match `DraftTrainer` single-anchor trajectory.
 - [ ] Add sampling and performance benchmarks in a separate follow-up. These training references do not replace verification of the inference algorithm.
 
 ## References

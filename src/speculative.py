@@ -110,6 +110,102 @@ class SpeculativeEngine:
 
         return seed_hidden, logits
 
+    def build_draft_prefix(
+        self,
+        fused_hidden: torch.Tensor,
+        tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Build Depth-1 drafter prefix K/V cache for tokens up to anchor.
+
+        Args:
+            fused_hidden: (1, L, D) target fused hidden states for positions 0..L-1.
+            tokens: (1, L) next token IDs 1..L.
+
+        Returns:
+            (prefix_k, prefix_v) or (None, None) if L == 0.
+        """
+        if fused_hidden.shape[1] == 0:
+            return None, None
+        token_emb = self.target_model.model.embed_tokens(tokens)
+        cache = DraftTTTCache(mode="single_anchor")
+        self.draft_block(fused_hidden, token_emb, ttt_cache=cache)
+        return cache.k_list[0], cache.v_list[0]
+
+    def _extend_draft_prefix(
+        self,
+        prefix_k: torch.Tensor | None,
+        prefix_v: torch.Tensor | None,
+        hidden: torch.Tensor,
+        tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Extend Depth-1 drafter prefix cache with newly accepted tokens."""
+        n_tokens = hidden.shape[1]
+        if n_tokens == 0:
+            return prefix_k, prefix_v
+        curr_k, curr_v = prefix_k, prefix_v
+        for j in range(n_tokens):
+            step_cache = DraftTTTCache(prefix_k=curr_k, prefix_v=curr_v, mode="single_anchor")
+            tok_emb = self.target_model.model.embed_tokens(tokens[:, j : j + 1])
+            self.draft_block(hidden[:, j : j + 1, :], tok_emb, ttt_cache=step_cache)
+            curr_k, curr_v = step_cache.k_list[0], step_cache.v_list[0]
+        return curr_k, curr_v
+
+    @torch.no_grad()
+    def draft_trajectory(
+        self,
+        prompt_tokens: torch.Tensor,
+        teacher_forced_tokens: torch.Tensor,
+        draft_steps: int = 4,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Run the actual inference draft path for an anchor with persistent prefix state.
+
+        Args:
+            prompt_tokens: (1, prompt_len) tokens up to anchor t (prompt_len = t + 1).
+            teacher_forced_tokens: (1, draft_steps) token IDs consumed at each draft depth
+                (step 1 consumes x[t+1], step 2 consumes x[t+2], ..., step r consumes x[t+r]).
+            draft_steps: number of draft steps to unroll.
+
+        Returns:
+            (hidden_list, logits_list) where each list has draft_steps tensors of shape
+            (1, 1, D) and (1, 1, V).
+        """
+        prompt_tokens = prompt_tokens.to(self.device)
+        teacher_forced_tokens = teacher_forced_tokens.to(self.device)
+        prompt_len = prompt_tokens.shape[1]
+        dummy_cache = self.target_model.make_cache(1, prompt_len + 10, self.dtype)
+        all_fused, _ = self._get_hidden_and_logits(prompt_tokens, dummy_cache)
+        anchor_hidden = all_fused[:, -1:, :]
+
+        if prompt_len > 1:
+            draft_prefix_k, draft_prefix_v = self.build_draft_prefix(
+                all_fused[:, :-1, :], prompt_tokens[:, 1:]
+            )
+        else:
+            draft_prefix_k, draft_prefix_v = None, None
+
+        draft_cache = DraftTTTCache(
+            prefix_k=draft_prefix_k,
+            prefix_v=draft_prefix_v,
+            mode="single_anchor",
+        )
+
+        hidden_list = []
+        logits_list = []
+        curr_hidden = anchor_hidden
+
+        for step in range(draft_steps):
+            tok = teacher_forced_tokens[:, step : step + 1]
+            token_emb = self.target_model.model.embed_tokens(tok)
+            draft_out = self.draft_block(curr_hidden, token_emb, ttt_cache=draft_cache)
+            draft_logits = self.target_model.lm_head(
+                self.draft_block.get_output_hidden(draft_out)
+            )
+            hidden_list.append(draft_out)
+            logits_list.append(draft_logits)
+            curr_hidden = draft_out
+
+        return hidden_list, logits_list
+
     @torch.no_grad()
     def generate(
         self,
@@ -150,9 +246,9 @@ class SpeculativeEngine:
 
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == "cuda"):
             # --- Prefill: run the full prompt through the target ---
-            prev_hidden, target_logits = self._get_hidden_and_logits(input_ids, target_cache)
+            all_fused, target_logits = self._get_hidden_and_logits(input_ids, target_cache)
             # prev_hidden: (1, 1, D) — representation of the last prompt token
-            prev_hidden = prev_hidden[:, -1:, :]
+            prev_hidden = all_fused[:, -1:, :]
 
             # First generated token (greedy from last prefill position)
             pending_token = target_logits[:, -1].float().argmax(-1)  # (1,)
@@ -174,20 +270,34 @@ class SpeculativeEngine:
                     }
                 return res
 
+            # Build persistent Depth-1 drafter prefix K/V cache for prompt tokens 0..prompt_len-2
+            if prompt_len > 1:
+                draft_prefix_k, draft_prefix_v = self.build_draft_prefix(
+                    all_fused[:, :-1, :], input_ids[:, 1:]
+                )
+            else:
+                draft_prefix_k, draft_prefix_v = None, None
+
             # Invariant maintained across iterations:
             # 1. target_cache contains all tokens up to the token immediately
             #    preceding `pending_token`.
             # 2. `pending_token` is the latest accepted token, pending entry into target_cache.
             # 3. `prev_hidden` is the representation of the token immediately
             #    preceding `pending_token` (the last token in target_cache).
+            # 4. (draft_prefix_k, draft_prefix_v) contains Depth-1 drafter K/V history
+            #    for all accepted tokens preceding `pending_token`.
             while len(generated) < max_new_tokens:
                 steps_to_draft = min(self.draft_steps, max_new_tokens - len(generated))
                 if steps_to_draft <= 0:
                     break
 
                 # === DRAFT PHASE ===
-                # Fresh EAGLE-3 TTT draft cache for this speculation round
-                draft_cache = DraftTTTCache(mode="single_anchor")
+                # EAGLE-3 TTT draft cache seeded with persistent Depth-1 prefix state
+                draft_cache = DraftTTTCache(
+                    prefix_k=draft_prefix_k,
+                    prefix_v=draft_prefix_v,
+                    mode="single_anchor",
+                )
 
                 draft_tokens: list[torch.Tensor] = []
                 draft_hidden = prev_hidden  # (1, 1, D)
@@ -218,6 +328,9 @@ class SpeculativeEngine:
                     # Fallback if no draft steps: process pending_token directly
                     target_hidden, target_logits = self._get_hidden_and_logits(
                         pending_token.view(1, 1), target_cache
+                    )
+                    draft_prefix_k, draft_prefix_v = self._extend_draft_prefix(
+                        draft_prefix_k, draft_prefix_v, prev_hidden, pending_token.view(1, 1)
                     )
                     prev_hidden = target_hidden[:, -1:, :]
                     pending_token = target_logits[:, -1].float().argmax(-1)
@@ -291,6 +404,14 @@ class SpeculativeEngine:
                     # prev_hidden is the hidden state of draft_tokens[K-1].
                     prev_hidden = verify_hidden[:, -1:, :]
                     pending_token = bonus
+
+                    # Extend persistent drafter prefix state with verified tokens
+                    draft_prefix_k, draft_prefix_v = self._extend_draft_prefix(
+                        draft_cache.k_list[0],
+                        draft_cache.v_list[0],
+                        verify_hidden[:, :K, :],
+                        verify_tokens[:, 1 : 1 + K],
+                    )
                 else:
                     # Mismatch at position n_accepted
                     for i in range(n_accepted):
@@ -325,6 +446,18 @@ class SpeculativeEngine:
                     # prev_hidden is the hidden state of the last replayed token.
                     prev_hidden = replay_hidden[:, -1:, :]
                     pending_token = correction
+
+                    # Extend persistent drafter prefix state with verified tokens
+                    if n_accepted == 0:
+                        draft_prefix_k = draft_cache.k_list[0]
+                        draft_prefix_v = draft_cache.v_list[0]
+                    else:
+                        draft_prefix_k, draft_prefix_v = self._extend_draft_prefix(
+                            draft_cache.k_list[0],
+                            draft_cache.v_list[0],
+                            replay_hidden[:, :n_accepted, :],
+                            replay_tokens[:, 1 : 1 + n_accepted],
+                        )
 
         result = torch.stack(generated, dim=1)[:, :max_new_tokens]
         if return_stats:

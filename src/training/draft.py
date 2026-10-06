@@ -172,6 +172,7 @@ class DraftTrainer(nn.Module):
         embed_fn: callable,
         lm_head_fn: callable,
         output_norm_fn: callable | None = None,
+        return_trajectories: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Run recursive draft unroll and compute LK loss.
 
@@ -216,6 +217,8 @@ class DraftTrainer(nn.Module):
         per_step_losses = []
         per_step_overlaps = []
         per_step_agreements = []
+        draft_hiddens = []
+        draft_logits_list = []
 
         # Current hidden state for the draft (starts from fused target features)
         draft_hidden = fused_features
@@ -265,6 +268,10 @@ class DraftTrainer(nn.Module):
             draft_norm = self.mtp_block.get_output_hidden(draft_hidden_out)
             draft_logits = lm_head_fn(draft_norm)  # (B, T-step_r, V)
 
+            if return_trajectories:
+                draft_hiddens.append(draft_hidden_out)
+                draft_logits_list.append(draft_logits)
+
             # Supervision: target logits shifted by step_r
             sup_target_logits = target_logits[:, step_r:T]  # (B, T-step_r, V)
             sup_targets = targets[:, step_r:T]  # for building mask
@@ -310,12 +317,16 @@ class DraftTrainer(nn.Module):
             weights = weights / weights.sum()
             total_loss = sum(w * l for w, l in zip(weights, per_step_losses))
 
-        return {
+        res = {
             "loss": total_loss,
             "per_step_loss": [l.item() if isinstance(l, torch.Tensor) else l for l in per_step_losses],
             "per_step_overlap": per_step_overlaps,
             "per_step_agreement": per_step_agreements,
         }
+        if return_trajectories:
+            res["draft_hidden"] = draft_hiddens
+            res["draft_logits"] = draft_logits_list
+        return res
 
 
 def single_anchor_sequential_reference(

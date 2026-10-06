@@ -349,6 +349,117 @@ def test_max_new_tokens_boundary():
     print("ok (max_new=1,2,3,5,7)")
 
 
+def test_draft_trainer_trajectory_matches_actual_inference_draft_path():
+    """Verify DraftTrainer's single-anchor trajectory directly matches the actual inference draft path."""
+    print("test_draft_trainer_trajectory_matches_actual_inference_draft_path...", end=" ", flush=True)
+    from src.training.draft import DraftConfig, DraftTrainer
+
+    config = make_tiny_config()
+    torch.manual_seed(42)
+    target_model = KimiK3ForCausalLM(config).eval()
+
+    draft_cfg = DraftConfig(
+        draft_steps=4,
+        feature_layer_indices=config.feature_layer_indices,
+    )
+    draft_trainer = DraftTrainer(target_model.mtp_block, draft_cfg).eval()
+    spec_engine = SpeculativeEngine(
+        target_model=target_model,
+        draft_block=draft_trainer,
+        draft_steps=draft_cfg.draft_steps,
+    )
+
+    B, T = 1, 10
+    tokens = torch.randint(0, config.vocab_size, (B, T + 1))
+    inputs = tokens[:, :-1]
+    targets = tokens[:, 1:].clone()
+
+    with torch.no_grad():
+        target_res = target_model(inputs, return_features=True)
+        target_features = target_res["features"]
+        target_logits = target_res["logits"]
+
+        # Run vectorized DraftTrainer training forward pass
+        train_out = draft_trainer(
+            target_features=target_features,
+            target_logits=target_logits,
+            targets=targets,
+            embed_fn=target_model.model.embed_tokens,
+            lm_head_fn=target_model.lm_head,
+            return_trajectories=True,
+        )
+        train_hidden = train_out["draft_hidden"]  # list of length draft_steps
+        train_logits = train_out["draft_logits"]  # list of length draft_steps
+
+        # Test multiple anchor positions across sequence
+        test_anchors = [0, 1, 3, 5]
+        for t in test_anchors:
+            prompt_tokens = tokens[:, : t + 1]
+            teacher_forced_tokens = targets[:, t : t + draft_cfg.draft_steps]
+
+            # Execute the ACTUAL SpeculativeEngine inference draft path
+            infer_hidden, infer_logits = spec_engine.draft_trajectory(
+                prompt_tokens=prompt_tokens,
+                teacher_forced_tokens=teacher_forced_tokens,
+                draft_steps=draft_cfg.draft_steps,
+            )
+
+            for step_idx in range(draft_cfg.draft_steps):
+                step_r = step_idx + 1
+                if t >= train_hidden[step_idx].shape[1]:
+                    continue
+
+                expected_h = train_hidden[step_idx][:, t : t + 1, :]
+                actual_h = infer_hidden[step_idx]
+                max_diff_h = (expected_h - actual_h).abs().max().item()
+                assert max_diff_h < 1e-5, (
+                    f"Hidden state mismatch between DraftTrainer and SpeculativeEngine "
+                    f"at anchor {t}, depth {step_r}! Max diff: {max_diff_h:.2e}"
+                )
+
+                expected_logits = train_logits[step_idx][:, t : t + 1, :]
+                actual_logits = infer_logits[step_idx]
+                max_diff_logits = (expected_logits - actual_logits).abs().max().item()
+                assert max_diff_logits < 1e-4, (
+                    f"Logits mismatch between DraftTrainer and SpeculativeEngine "
+                    f"at anchor {t}, depth {step_r}! Max diff: {max_diff_logits:.2e}"
+                )
+
+    print("ok (DraftTrainer vectorized matches actual SpeculativeEngine inference draft path)")
+
+
+def test_persistent_draft_prefix_across_speculation_rounds():
+    """Verify SpeculativeEngine maintains correct persistent draft prefix across multiple acceptance rounds."""
+    print("test_persistent_draft_prefix_across_speculation_rounds...", end=" ", flush=True)
+    from src.training.draft import DraftConfig, DraftTrainer
+
+    config = make_tiny_config()
+    torch.manual_seed(123)
+    model = KimiK3ForCausalLM(config).eval()
+
+    draft_cfg = DraftConfig(
+        draft_steps=4,
+        feature_layer_indices=config.feature_layer_indices,
+    )
+    draft_trainer = DraftTrainer(model.mtp_block, draft_cfg).eval()
+
+    prompt = torch.randint(0, config.vocab_size, (1, 6))
+    max_new = 25
+
+    target_tokens = target_greedy_generate(model, prompt, max_new)
+    spec_engine = SpeculativeEngine(model, draft_block=draft_trainer, draft_steps=4)
+    spec_tokens, stats = spec_engine.generate(prompt, max_new, return_stats=True)
+
+    assert torch.equal(target_tokens, spec_tokens), (
+        f"Mismatch across multiple rounds with persistent draft prefix!\n"
+        f"  Target: {target_tokens[0].tolist()}\n"
+        f"  Spec:   {spec_tokens[0].tolist()}"
+    )
+    assert stats["num_rounds"] > 1, f"Expected multiple rounds, got {stats['num_rounds']}"
+    assert stats["draft_proposed"] > 0, "No drafts were proposed"
+    print(f"ok ({stats['num_rounds']} rounds, {stats['total_tokens_generated']} tokens, acceptance_rate={stats['acceptance_rate']:.2%})")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Speculative Decoding Tests")
@@ -366,6 +477,8 @@ if __name__ == "__main__":
     test_draft_steps_1()
     test_tied_embeddings()
     test_max_new_tokens_boundary()
+    test_draft_trainer_trajectory_matches_actual_inference_draft_path()
+    test_persistent_draft_prefix_across_speculation_rounds()
 
     print("=" * 60)
     print("All speculative decoding tests passed!")

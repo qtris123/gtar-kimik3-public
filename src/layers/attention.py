@@ -90,8 +90,8 @@ class Attention(nn.Module):
 
         if ttt_cache is not None:
             ttt_cache.append(key_states, value_states)
-            if ttt_cache.step_count == 1:
-                # Step 1: initial causal prefix step
+            if ttt_cache.step_count == 1 and query_states.shape[2] == key_states.shape[2] and key_states.shape[2] > 1:
+                # Step 1: initial multi-token causal prefix step
                 attn_output = flash_attention(query_states, key_states, value_states)
             else:
                 # Step r >= 2: diagonal-extension TTT attention
