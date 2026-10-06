@@ -40,6 +40,11 @@ This report documents the completed implementation and verification of the two-s
     $$\mathcal{L}_{\text{LK}} = -\mathbb{E}\left[\log(\max(\text{overlap}, \epsilon))\right]$$
   - Multi-step combination: supports uniform averaging or exponential decay $\sum_r \gamma^r \mathcal{L}_r$.
   - Target model parameters are frozen; only MTP block and feature projection are optimized.
+- **TTT Attention History & Diagonal-Extension Masking**:
+  - EAGLE-3 TTT attention requires each anchor $t$ at depth $r$ to attend to the causal prefix $0 \le t' \le t$ from depth 1, plus its own continuation states from depths $s < r$ at position $t' = t$.
+  - Implemented `DraftTTTCache` in `src/cache.py` tracking per-depth K/V history across recursive unrolls with transactional fork/commit/rollback.
+  - Implemented `build_ttt_diagonal_mask` and vectorized diagonal-extension attention in `src/layers/attention.py`.
+  - Added `single_anchor_sequential_reference` in `src/training/draft.py` to verify vectorized output matches single-anchor sequential evaluation exactly without future-token leakage.
 
 ---
 
@@ -47,19 +52,22 @@ This report documents the completed implementation and verification of the two-s
 
 | File | Type | Description |
 |---|---|---|
-| `src/models/mtp.py` | New | `MTPBlock` with fusion, shallow causal attention, SwiGLU, and output norm. |
+| `src/models/mtp.py` | New | `MTPBlock` with fusion, shallow causal attention, SwiGLU, and output norm; supports `ttt_cache`. |
 | `src/models/kimi_k3.py` | Modified | Added `mtp_block` initialization, intermediate feature extraction API, joint MTP loss computation, FLOP accounting. |
 | `src/models/__init__.py` | Modified | Exported `MTPBlock`. |
-| `src/training/__init__.py` | New | Package init exporting `DraftTrainer`, `DraftConfig`, `lk_loss`. |
-| `src/training/draft.py` | New | `FeatureProjection`, pure LK loss, overlap & agreement metrics, recursive unroll module `DraftTrainer`. |
+| `src/cache.py` | Modified | Added `DraftTTTCache` with vectorized and single-anchor modes, transactional fork/commit/rollback. |
+| `src/layers/attention.py` | Modified | Added `build_ttt_diagonal_mask` and diagonal-extension TTT attention forward for `DraftTTTCache`. |
+| `src/training/__init__.py` | New | Package init exporting `DraftTrainer`, `DraftConfig`, `lk_loss`, `single_anchor_sequential_reference`. |
+| `src/training/draft.py` | New | `FeatureProjection`, pure LK loss, overlap & agreement metrics, recursive unroll module `DraftTrainer` with `DraftTTTCache`, and `single_anchor_sequential_reference`. |
+| `src/speculative.py` | Modified | Integrated `DraftTTTCache` in single-anchor mode for draft generation loop. |
 | `src/common.py` | Modified | Updated `evaluate()` to isolate `main_loss`, updated checkpoint loader for flexible/strict MTP key initialization. |
 | `scripts/train.py` | Modified | Added MTP configuration, `--strict-resume` support, separate logging for `main_loss`, `mtp_loss`, and MTP gradient norms. |
 | `scripts/train_draft.py` | New | Stage 2 training script: loads frozen target, initializes draft, trains with LK loss, saves draft checkpoint. |
 | `configs/kimi_k3_tiny_mtp.json` | New | Tiny 4-layer config for testing both Stage 1 and Stage 2 pipelines. |
 | `configs/kimi_k3_0.6B_mtp.json` | New | 0.6B production config with MTP enabled (feature layers `[4, 13, 27]`). |
 | `tests/test_mtp.py` | New | Comprehensive Stage 1 test suite (14 unit/regression/overfit tests). |
-| `tests/test_draft_training.py` | New | Comprehensive Stage 2 test suite (13 unit/regression/overfit tests). |
-| `tests/test_speculative.py` | New | Speculative decoding requirements & test specification stub. |
+| `tests/test_draft_training.py` | Modified | Stage 2 test suite including TTT attention history, single-anchor reference matching, and no-future-leakage tests (16 tests total). |
+| `tests/test_speculative.py` | Modified | Speculative decoding tests including single-anchor draft cache tests. |
 
 ---
 
@@ -96,6 +104,9 @@ Executed via `/home/gpuuser/.venv/bin/python`:
    - `test_draft_checkpoint_round_trip`: **PASSED**
    - `test_draft_overfit`: **PASSED** (loss: 0.136 -> 0.033, overlap: 0.873 -> 0.968)
    - `test_gradients_through_unroll`: **PASSED**
+   - `test_single_anchor_sequential_reference_matches_vectorized`: **PASSED** (vectorized vs slow sequential reference match across anchors $t \in \{0, 1, 3, 5\}$ and depths $r \in \{1, 2, 3, 4\}$, max diff: 0.00e+00)
+   - `test_ttt_attention_history_maintained`: **PASSED** (verifies depth 2 depends directly on depth 1 attention state)
+   - `test_ttt_no_future_leakage`: **PASSED** (verifies future token perturbations do not alter past anchor hidden states or logits)
 
 ### End-to-End Smoke Training Runs
 1. **Stage 1 Training (`scripts/train.py`)**:

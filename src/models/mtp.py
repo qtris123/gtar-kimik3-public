@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..cache import KVCache
+from ..cache import KVCache, DraftTTTCache
 from ..layers import Attention, RMSNorm, SwiGLU
 
 
@@ -91,30 +91,34 @@ class MTPBlock(nn.Module):
         """
         return self.mixer.make_cache(batch_size, max_seq_len, device, dtype)
 
+    def fuse(self, prev_hidden: torch.Tensor, token_embedding: torch.Tensor) -> torch.Tensor:
+        """Fuse prior hidden state and next-token embedding."""
+        return self.fuse_proj(
+            torch.cat([self.norm_hidden(prev_hidden), self.norm_embed(token_embedding)], dim=-1)
+        )
+
     def forward(
         self,
         prev_hidden: torch.Tensor,
         token_embedding: torch.Tensor,
         cache: KVCache | None = None,
+        ttt_cache: DraftTTTCache | None = None,
     ) -> torch.Tensor:
         """
         Args:
             prev_hidden: (B, T, D) hidden states from the prior step.
             token_embedding: (B, T, D) embeddings of the next-position tokens.
-            cache: optional KV cache for incremental attention (speculative
-                   decoding). When provided, the attention layer appends
-                   to and attends over the full cached history.
+            cache: optional KV cache for standard incremental attention.
+            ttt_cache: optional DraftTTTCache for EAGLE-3 TTT recursive attention.
 
         Returns:
             hidden_states: (B, T, D) refined hidden states.
         """
         # Fuse: normalize each input independently, concatenate, project
-        fused = self.fuse_proj(
-            torch.cat([self.norm_hidden(prev_hidden), self.norm_embed(token_embedding)], dim=-1)
-        )
+        fused = self.fuse(prev_hidden, token_embedding)
 
-        # Residual causal self-attention (optionally cached)
-        hidden_states = fused + self.mixer(self.input_layernorm(fused), cache=cache)
+        # Residual causal self-attention (optionally cached or TTT-managed)
+        hidden_states = fused + self.mixer(self.input_layernorm(fused), cache=cache, ttt_cache=ttt_cache)
 
         # Residual SwiGLU FFN
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))

@@ -111,3 +111,64 @@ class Cache:
         """Rollback all layer caches to the snapshot."""
         for layer_cache in self.layers:
             layer_cache.rollback()
+
+
+class DraftTTTCache:
+    """TTT (Training-Time Test) attention cache for EAGLE-3 drafter.
+
+    Preserves per-anchor K/V history across recursive speculative depths:
+    - Step 1: stores full sequence K/V states (causal initial prefix).
+    - Step r (r >= 2): stores depth-r K/V states.
+
+    In vectorized training mode:
+      At step r, query position t attends to:
+      1. Prefix positions 0..t from step 1 (causal prefix).
+      2. Same anchor position t from steps 2..r (diagonal extension).
+      This avoids mixing different anchors' speculative trajectories.
+
+    In single-anchor mode (speculative inference or sequential reference):
+      At step r, query (length 1) attends to the anchor's causal prefix
+      plus the same anchor's previous draft K/V states.
+    """
+
+    def __init__(
+        self,
+        prefix_k: torch.Tensor | None = None,
+        prefix_v: torch.Tensor | None = None,
+        mode: str = "vectorized",
+    ):
+        self.k_list: list[torch.Tensor] = []
+        self.v_list: list[torch.Tensor] = []
+        self.mode = mode
+        self._snapshot_len: int | None = None
+        if prefix_k is not None and prefix_v is not None:
+            self.k_list.append(prefix_k)
+            self.v_list.append(prefix_v)
+
+    def append(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        self.k_list.append(k)
+        self.v_list.append(v)
+
+    @property
+    def step_count(self) -> int:
+        return len(self.k_list)
+
+    def reset(self) -> None:
+        self.k_list.clear()
+        self.v_list.clear()
+        self._snapshot_len = None
+
+    def fork(self) -> None:
+        """Snapshot current depth for speculative transactional rollback."""
+        self._snapshot_len = len(self.k_list)
+
+    def commit(self) -> None:
+        """Clear snapshot upon acceptance."""
+        self._snapshot_len = None
+
+    def rollback(self) -> None:
+        """Rollback to the snapshot depth."""
+        if self._snapshot_len is not None:
+            self.k_list = self.k_list[: self._snapshot_len]
+            self.v_list = self.v_list[: self._snapshot_len]
+            self._snapshot_len = None

@@ -12,9 +12,17 @@ from dataclasses import asdict
 import torch
 import torch.nn.functional as F
 
+from src.cache import DraftTTTCache
 from src.models.kimi_k3 import KimiK3Config, KimiK3ForCausalLM
 from src.models.mtp import MTPBlock
-from src.training.draft import DraftConfig, DraftTrainer, FeatureProjection, lk_loss, compute_overlap_and_agreement
+from src.training.draft import (
+    DraftConfig,
+    DraftTrainer,
+    FeatureProjection,
+    lk_loss,
+    compute_overlap_and_agreement,
+    single_anchor_sequential_reference,
+)
 
 
 def make_tiny_config(**overrides):
@@ -474,6 +482,178 @@ def test_gradients_through_unroll():
     print("ok")
 
 
+def test_single_anchor_sequential_reference_matches_vectorized():
+    """Verify that vectorized DraftTrainer unroll matches slow single-anchor reference.
+
+    EAGLE-3 TTT attention requires that for every anchor t at depth r:
+    - Depth r attends to causal prefix (depth 1, positions 0..t)
+      plus the same anchor's draft states at depths < r.
+    - Vectorized DraftTrainer uses diagonal-extension attention across all anchors.
+    - The slow single-anchor sequential reference runs depth-by-step for a single anchor.
+    Both must produce identical hidden states and logits down to numerical tolerance!
+    """
+    print("test_single_anchor_sequential_reference_matches_vectorized...", end=" ", flush=True)
+    target_model, draft_trainer, config = build_target_and_draft(device="cpu")
+    draft_trainer.eval()
+
+    torch.manual_seed(42)
+    B, T = 2, 12
+    inputs = torch.randint(0, config.vocab_size, (B, T))
+    targets = torch.randint(0, config.vocab_size, (B, T))
+
+    with torch.no_grad():
+        res = target_model(inputs, return_features=True)
+        target_logits = res["logits"]
+        target_features = res["features"]
+
+        cfg = draft_trainer.config
+        feature_indices = cfg.feature_layer_indices
+        fused = draft_trainer.feature_proj(
+            target_features[f"feature_{feature_indices[0]}"],
+            target_features[f"feature_{feature_indices[1]}"],
+            target_features[f"feature_{feature_indices[2]}"],
+        )
+
+        ttt_cache_vec = DraftTTTCache(mode="vectorized")
+        draft_hidden_vec = fused
+        vec_hidden_by_step = []
+        vec_logits_by_step = []
+
+        for step_r in range(1, cfg.draft_steps + 1):
+            hidden_input = draft_hidden_vec[:, : T - step_r]
+            token_ids = targets[:, step_r - 1 : T - 1].clone()
+            valid_tokens = token_ids != -100
+            token_ids[~valid_tokens] = 0
+            token_emb = target_model.model.embed_tokens(token_ids) * valid_tokens.unsqueeze(-1).float()
+
+            out_r = draft_trainer.mtp_block(hidden_input, token_emb, ttt_cache=ttt_cache_vec)
+            vec_hidden_by_step.append(out_r)
+
+            norm_r = draft_trainer.mtp_block.get_output_hidden(out_r)
+            logits_r = target_model.lm_head(norm_r)
+            vec_logits_by_step.append(logits_r)
+
+            new_h = torch.zeros_like(fused)
+            new_h[:, : T - step_r] = out_r
+            draft_hidden_vec = new_h
+
+        # Test multiple anchor positions across sequence
+        test_anchors = [0, 1, 3, 5]
+        for t in test_anchors:
+            seq_hidden, seq_logits = single_anchor_sequential_reference(
+                draft_trainer=draft_trainer,
+                target_features=target_features,
+                targets=targets,
+                embed_fn=target_model.model.embed_tokens,
+                anchor_idx=t,
+                draft_steps=cfg.draft_steps,
+                lm_head_fn=target_model.lm_head,
+            )
+
+            for step_idx in range(len(seq_hidden)):
+                step_r = step_idx + 1
+                if t >= vec_hidden_by_step[step_idx].shape[1]:
+                    continue
+
+                v_h = vec_hidden_by_step[step_idx][:, t : t + 1, :]
+                s_h = seq_hidden[step_idx]
+
+                max_diff_h = (v_h - s_h).abs().max().item()
+                assert max_diff_h < 1e-5, (
+                    f"Hidden state mismatch at anchor {t}, step {step_r}! "
+                    f"Max diff: {max_diff_h:.2e}"
+                )
+
+                v_logits = vec_logits_by_step[step_idx][:, t : t + 1, :]
+                s_logits = seq_logits[step_idx]
+                max_diff_logits = (v_logits - s_logits).abs().max().item()
+                assert max_diff_logits < 1e-4, (
+                    f"Logits mismatch at anchor {t}, step {step_r}! "
+                    f"Max diff: {max_diff_logits:.2e}"
+                )
+
+    print("ok (vectorized matches sequential across depths 1..4)")
+
+
+def test_ttt_attention_history_maintained():
+    """Verify that draft depth 2 attends to depth 1 history (history is NOT discarded)."""
+    print("test_ttt_attention_history_maintained...", end=" ", flush=True)
+    target_model, draft_trainer, config = build_target_and_draft(device="cpu")
+    draft_trainer.eval()
+
+    torch.manual_seed(123)
+    B, T = 1, 8
+    inputs = torch.randint(0, config.vocab_size, (B, T))
+    targets = torch.randint(0, config.vocab_size, (B, T))
+
+    with torch.no_grad():
+        res = target_model(inputs, return_features=True)
+        target_features = res["features"]
+
+        ttt_cache = DraftTTTCache(mode="vectorized")
+        fused = draft_trainer.feature_proj(
+            target_features[f"feature_{config.feature_layer_indices[0]}"],
+            target_features[f"feature_{config.feature_layer_indices[1]}"],
+            target_features[f"feature_{config.feature_layer_indices[2]}"],
+        )
+
+        # Step 1
+        h1 = draft_trainer.mtp_block(
+            fused[:, : T - 1],
+            target_model.model.embed_tokens(targets[:, : T - 1]),
+            ttt_cache=ttt_cache,
+        )
+        # Step 2 with step 1 history in cache
+        h2_with_history = draft_trainer.mtp_block(
+            h1[:, : T - 2],
+            target_model.model.embed_tokens(targets[:, 1 : T - 1]),
+            ttt_cache=ttt_cache,
+        )
+
+        # Step 2 with cache=None (discarding history like the old bug)
+        h2_no_history = draft_trainer.mtp_block(
+            h1[:, : T - 2],
+            target_model.model.embed_tokens(targets[:, 1 : T - 1]),
+            ttt_cache=None,
+        )
+
+        # They MUST differ, proving that history is actively used!
+        diff = (h2_with_history - h2_no_history).abs().max().item()
+        assert diff > 1e-4, f"Step 2 should depend on step 1 history, but diff is {diff:.2e}"
+    print(f"ok (history actively contributes: diff={diff:.4f})")
+
+
+def test_ttt_no_future_leakage():
+    """Verify that tokens at position t' > t do not affect anchor t at any depth."""
+    print("test_ttt_no_future_leakage...", end=" ", flush=True)
+    target_model, draft_trainer, config = build_target_and_draft(device="cpu")
+    draft_trainer.eval()
+
+    torch.manual_seed(999)
+    B, T = 1, 10
+    inputs = torch.randint(0, config.vocab_size, (B, T))
+    targets1 = torch.randint(0, config.vocab_size, (B, T))
+    targets2 = targets1.clone()
+    # Perturb the last token of targets2
+    targets2[:, -1] = (targets2[:, -1] + 1) % config.vocab_size
+
+    with torch.no_grad():
+        res1 = target_model(inputs, return_features=True)
+        res2 = target_model(inputs, return_features=True)
+
+        h_seq1, _ = single_anchor_sequential_reference(
+            draft_trainer, res1["features"], targets1, target_model.model.embed_tokens, anchor_idx=2, draft_steps=3
+        )
+        h_seq2, _ = single_anchor_sequential_reference(
+            draft_trainer, res2["features"], targets2, target_model.model.embed_tokens, anchor_idx=2, draft_steps=3
+        )
+
+        for step_idx in range(3):
+            diff = (h_seq1[step_idx] - h_seq2[step_idx]).abs().max().item()
+            assert diff == 0.0, f"Future token affected anchor 2 at step {step_idx+1}: diff={diff}"
+    print("ok (no future leakage)")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Stage 2 Draft Training Tests")
@@ -492,6 +672,9 @@ if __name__ == "__main__":
     test_draft_checkpoint_round_trip()
     test_draft_overfit()
     test_gradients_through_unroll()
+    test_single_anchor_sequential_reference_matches_vectorized()
+    test_ttt_attention_history_maintained()
+    test_ttt_no_future_leakage()
 
     print("=" * 60)
     print("All Stage 2 tests passed!")

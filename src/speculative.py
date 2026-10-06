@@ -34,7 +34,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .cache import Cache
+from .cache import Cache, DraftTTTCache
 from .models.mtp import MTPBlock
 
 
@@ -186,10 +186,8 @@ class SpeculativeEngine:
                     break
 
                 # === DRAFT PHASE ===
-                # Fresh draft cache each round
-                draft_cache = self.draft_block.make_cache(
-                    1, steps_to_draft + 1, self.device, self.dtype
-                )
+                # Fresh EAGLE-3 TTT draft cache for this speculation round
+                draft_cache = DraftTTTCache(mode="single_anchor")
 
                 draft_tokens: list[torch.Tensor] = []
                 draft_hidden = prev_hidden  # (1, 1, D)
@@ -200,7 +198,7 @@ class SpeculativeEngine:
                     token_emb = self.target_model.model.embed_tokens(tok)  # (1, 1, D)
 
                     draft_out = self.draft_block(
-                        draft_hidden, token_emb, cache=draft_cache
+                        draft_hidden, token_emb, ttt_cache=draft_cache
                     )  # (1, 1, D)
 
                     draft_logits = self.target_model.lm_head(
