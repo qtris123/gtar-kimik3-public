@@ -147,19 +147,6 @@ class KimiK3ForCausalLM(nn.Module):
             for residual_proj in (self.mtp_block.mixer.o_proj, self.mtp_block.mlp.down_proj):
                 nn.init.normal_(residual_proj.weight, std=std / math.sqrt(2))
 
-    def estimate_flops_per_token(self, seq_len: int) -> int:
-        config = self.config
-        matmul_params = sum(p.numel() for p in self.model.layers.parameters()) + self.lm_head.weight.numel()
-        num_attention_layers = sum(layer.is_attention for layer in self.model.layers)
-        attention_flops = 12 * num_attention_layers * config.num_attention_heads * config.head_dim * seq_len
-        base_flops = 6 * matmul_params + attention_flops
-        # Include MTP block overhead when enabled
-        if self.mtp_block is not None:
-            mtp_params = sum(p.numel() for p in self.mtp_block.parameters())
-            mtp_attn_flops = 12 * config.num_attention_heads * config.head_dim * seq_len
-            base_flops += 6 * mtp_params + mtp_attn_flops
-        return base_flops
-
     def make_cache(self, batch_size: int, max_seq_len: int, dtype) -> Cache:
         device = self.lm_head.weight.device
         return Cache([layer.mixer.make_cache(batch_size, max_seq_len, device, dtype) for layer in self.model.layers])

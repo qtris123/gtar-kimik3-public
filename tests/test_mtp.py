@@ -411,24 +411,6 @@ def test_inference_compatibility():
     print(f"ok (max error: {error:.1e})")
 
 
-def test_estimate_flops_with_mtp():
-    """Verify FLOP estimation includes MTP overhead."""
-    print("test_estimate_flops_with_mtp...", end=" ")
-    config_no_mtp = make_tiny_config(mtp_enabled=False)
-    config_mtp = make_tiny_config(mtp_enabled=True)
-
-    torch.manual_seed(0)
-    model_no_mtp = KimiK3ForCausalLM(config_no_mtp)
-    torch.manual_seed(0)
-    model_mtp = KimiK3ForCausalLM(config_mtp)
-
-    flops_no_mtp = model_no_mtp.estimate_flops_per_token(128)
-    flops_mtp = model_mtp.estimate_flops_per_token(128)
-
-    assert flops_mtp > flops_no_mtp, \
-        f"MTP FLOP estimate ({flops_mtp}) should be > base ({flops_no_mtp})"
-    print(f"ok (base: {flops_no_mtp:.2e}, with MTP: {flops_mtp:.2e})")
-
 
 def test_mtp_agreement_metrics():
     """Verify mtp_agreement and main_agreement computation and evaluate() metrics."""
@@ -487,7 +469,6 @@ if __name__ == "__main__":
     test_feature_extraction()
     test_cpu_smoke_overfit()
     test_inference_compatibility()
-    test_estimate_flops_with_mtp()
     test_mtp_agreement_metrics()
 
     print("=" * 60)

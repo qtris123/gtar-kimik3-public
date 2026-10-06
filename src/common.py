@@ -6,10 +6,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
-PEAK_FLOPS = {"B200": 2250e12, "H200": 989e12, "H100": 989e12, "A100": 312e12}
-
-
 def init_distributed() -> tuple[int, int, torch.device]:
     if "RANK" not in os.environ:
         return 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,11 +27,6 @@ def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(tensor)
         tensor /= dist.get_world_size()
     return tensor
-
-
-def get_peak_flops(device: torch.device) -> float:
-    name = torch.cuda.get_device_name(device) if device.type == "cuda" else ""
-    return next((flops for key, flops in PEAK_FLOPS.items() if key in name), float("inf"))
 
 
 @torch.no_grad()
