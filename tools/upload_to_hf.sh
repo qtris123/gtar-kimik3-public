@@ -9,4 +9,4 @@ elif [ -f "/home/gpuuser/.venv/bin/activate" ]; then
     source /home/gpuuser/.venv/bin/activate
 fi
 
-python scripts/upload_to_hf.py "$@"
+python tools/upload_to_hf.py "$@"

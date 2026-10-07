@@ -1,5 +1,17 @@
-__pycache__/
+# Machine-specific symlinks and data
+.venv
 .venv/
+data
 data/
+out
 out/
+wandb
 wandb/
+
+# Python / test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.coverage

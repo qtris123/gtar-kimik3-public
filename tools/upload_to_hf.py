@@ -3,10 +3,10 @@ Resumable high-speed upload of checkpoint directory to Hugging Face Hub.
 
 Usage:
   Option A (Make repo public - NO storage limit, full 247GB):
-    python scripts/upload_to_hf.py --repo-id qtris123/KimiK3 --public
+    python tools/upload_to_hf.py --repo-id qtris123/KimiK3 --public
 
   Option B (Keep repo private - upload key final checkpoints ~8GB):
-    python scripts/upload_to_hf.py --repo-id qtris123/KimiK3 --key-only
+    python tools/upload_to_hf.py --repo-id qtris123/KimiK3 --key-only
 """
 
 import argparse

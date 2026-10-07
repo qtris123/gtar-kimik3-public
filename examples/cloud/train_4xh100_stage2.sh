@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Fine-tune the 0.6B MTP draft layer with custom fused layers [0, 4, 27] on 4 GPUs.
+# Fine-tune the 0.6B MTP draft layer with custom fused layers [0, 4, 27] on 4x H100 GPUs.
 #
 # Usage:
-#   bash scripts/train_draft_0.6B_fused_0_4_27.sh
-#   bash scripts/train_draft_0.6B_fused_0_4_27.sh /scratch/out/kimi_k3_0.6B_mtp/ckpt_019073.pt
+#   bash examples/cloud/train_4xh100_stage2.sh
+#   bash examples/cloud/train_4xh100_stage2.sh /scratch/out/kimi_k3_0.6B_mtp/ckpt_019073.pt
 #
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Auto-link virtual environment and data/scratch directories if missing
 if [ ! -d ".venv" ] && [ -d "/home/gpuuser/.venv" ]; then
@@ -40,14 +40,14 @@ GPUS="${GPUS:-4}"
 
 echo "======================================================================"
 echo " Starting Stage 2 Draft Training with Fused Layers [0, 4, 27]"
-echo " System:            gstar-kimi3-public (latest clean implementation)"
+echo " System:            gstar-kimi3-public (4x H100 cloud cluster)"
 echo " Target Checkpoint: ${TARGET_CKPT}"
 echo " Output Directory:  ${OUT_DIR}"
 echo " WandB Run Name:    ${WANDB_RUN}"
 echo " GPUs:              ${GPUS}"
 echo "======================================================================"
 
-torchrun --standalone --nproc_per_node="${GPUS}" -m scripts.train_draft \
+torchrun --standalone --nproc_per_node="${GPUS}" -m scripts.train_stage2 \
     --config configs/kimi_k3_0.6B_mtp.json \
     --target-checkpoint "${TARGET_CKPT}" \
     --feature-layers "0,4,27" \
