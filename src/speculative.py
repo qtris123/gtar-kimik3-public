@@ -116,14 +116,17 @@ class SpeculativeEngine:
         target_model: nn.Module,
         draft_block: MTPBlock | nn.Module | None = None,
         feature_proj: nn.Module | None = None,
+        feature_layer_indices: list[int] | None = None,
         draft_steps: int = 4,
     ):
         self.target_model = target_model.eval()
 
-        # If a DraftTrainer was passed, unwrap its mtp_block and feature_proj
+        # If a DraftTrainer was passed, unwrap its mtp_block, feature_proj, and feature_layer_indices
         if draft_block is not None and hasattr(draft_block, "mtp_block"):
             if feature_proj is None and hasattr(draft_block, "feature_proj"):
                 feature_proj = draft_block.feature_proj
+            if feature_layer_indices is None and hasattr(draft_block, "config") and getattr(draft_block.config, "feature_layer_indices", None):
+                feature_layer_indices = list(draft_block.config.feature_layer_indices)
             draft_block = draft_block.mtp_block
 
         self.draft_block = (draft_block or target_model.mtp_block)
@@ -133,6 +136,11 @@ class SpeculativeEngine:
         self.feature_proj = feature_proj
         if self.feature_proj is not None:
             self.feature_proj = self.feature_proj.eval()
+
+        # Determine feature layer indices for fusion and synchronize with target model
+        self.feature_layer_indices = feature_layer_indices or getattr(target_model.config, "feature_layer_indices", [0, 4, 27])
+        if hasattr(self.target_model, "config") and self.feature_proj is not None:
+            self.target_model.config.feature_layer_indices = self.feature_layer_indices
 
         self.draft_steps = draft_steps
 
@@ -155,7 +163,7 @@ class SpeculativeEngine:
         features = result["features"]
 
         if self.feature_proj is not None:
-            feature_indices = self.target_model.config.feature_layer_indices
+            feature_indices = self.feature_layer_indices
             low = features[f"feature_{feature_indices[0]}"]
             mid = features[f"feature_{feature_indices[1]}"]
             high = features[f"feature_{feature_indices[2]}"]

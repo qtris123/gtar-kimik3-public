@@ -15,8 +15,8 @@
     "mtp_enabled": true,
     "mtp_loss_weight": 0.3,
     "feature_layer_indices": [
-      3,
-      13,
+      0,
+      4,
       27
     ]
   },
