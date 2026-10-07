@@ -1,10 +1,10 @@
 """
 Stage 2: Fine-tune the MTP block as an EAGLE-style recursive drafter against a frozen target.
 
-python -m scripts.train_stage2 --config configs/kimi_k3_tiny_mtp.json --data data/test \
+python -m scripts.train_draft --config configs/kimi_k3_tiny_mtp.json --data data/test \
     --target-checkpoint out/kimi_k3_tiny_mtp/ckpt_000020.pt --no-compile
 
-torchrun --standalone --nproc_per_node=4 -m scripts.train_stage2 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train_draft \
     --config configs/kimi_k3_tiny_mtp.json --data data/test \
     --target-checkpoint out/kimi_k3_tiny_mtp/ckpt_final.pt
 

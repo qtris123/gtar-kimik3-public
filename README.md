@@ -71,9 +71,9 @@ The codebase is structured around three consecutive stages:
 │   ├── test_draft_training.py     # Stage 2 tests (unroll, LK loss, TTT cache)
 │   ├── test_speculative.py        # Stage 3 tests (exact token identity, rollback)
 │   └── helpers.py                 # Test trajectory & validation references
-└── tools/
-    ├── upload_to_hf.py            # Hugging Face checkpoint upload tool
-    └── upload_to_hf.sh            # Upload launcher script
+└── scripts/
+    ├── train_kimi_k3_0.6B_mtp.sh  # Launcher for Stage 1 MTP pretraining
+    └── train_draft_0.6B.sh        # Launcher for Stage 2 drafter training
 ```
 
 ---
@@ -82,11 +82,11 @@ The codebase is structured around three consecutive stages:
 
 For studying this codebase, read the core implementation in this order:
 
-1. **[`src/models/mtp.py`](file:///home/gpuuser/gstar-kimi3-public/src/models/mtp.py)**: The MTP block structure (RMSNorm on trunk input, projection, attention/FFN layer, output RMSNorm).
-2. **[`src/models/kimi_k3.py`](file:///home/gpuuser/gstar-kimi3-public/src/models/kimi_k3.py)**: How the main model feeds trunk hidden states and ground-truth shifted tokens to the MTP block during Stage 1.
-3. **[`src/training/draft.py`](file:///home/gpuuser/gstar-kimi3-public/src/training/draft.py)**: Stage 2 recursive unroll, `FeatureProjection([0, 0, I])`, and the LK acceptance-overlap loss.
-4. **[`src/cache.py`](file:///home/gpuuser/gstar-kimi3-public/src/cache.py)**: `DraftTTTCache` (depth-1 causal prefix + diagonal extension) and transactional cache methods (`fork`, `commit`, `rollback`).
-5. **[`src/speculative.py`](file:///home/gpuuser/gstar-kimi3-public/src/speculative.py)**: `SpeculativeEngine` implementing verify-then-accept greedy generation, full match commit `1+K`, and rollback + replay on rejection.
+1. **[`src/models/mtp.py`](src/models/mtp.py)**: The MTP block structure (RMSNorm on trunk input, projection, attention/FFN layer, output RMSNorm).
+2. **[`src/models/kimi_k3.py`](src/models/kimi_k3.py)**: How the main model feeds trunk hidden states and ground-truth shifted tokens to the MTP block during Stage 1.
+3. **[`src/training/draft.py`](src/training/draft.py)**: Stage 2 recursive unroll, `FeatureProjection([0, 0, I])`, and the LK acceptance-overlap loss.
+4. **[`src/cache.py`](src/cache.py)**: `DraftTTTCache` (depth-1 causal prefix + diagonal extension) and transactional cache methods (`fork`, `commit`, `rollback`).
+5. **[`src/speculative.py`](src/speculative.py)**: `SpeculativeEngine` implementing verify-then-accept greedy generation, full match commit `1+K`, and rollback + replay on rejection.
 
 ---
 
