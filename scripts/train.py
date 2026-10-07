@@ -36,7 +36,7 @@ from src.common import (
     print0,
     save_checkpoint,
 )
-from src.models import ARCHITECTURES
+from src.models import KimiK3Config, KimiK3ForCausalLM
 from src.optim import build_optimizer, get_lr
 
 parser = argparse.ArgumentParser(description="Pretrain a language model")
@@ -81,11 +81,10 @@ train_loader = TokenLoader(args.data, "train", args.device_batch_size, args.seq_
 build_val_loader = lambda: TokenLoader(args.data, "val", args.device_batch_size, args.seq_len, rank, world_size, device)
 
 vocab_size = math.ceil(train_loader.meta["vocab_size"] / 128) * 128
-Config, ForCausalLM = ARCHITECTURES[config_file["arch"]]
-config = Config(vocab_size=vocab_size, **config_file["model"])
+config = KimiK3Config(vocab_size=vocab_size, **config_file["model"])
 mtp_enabled = getattr(config, "mtp_enabled", False)
 with torch.device(device):
-    model = ForCausalLM(config)
+    model = KimiK3ForCausalLM(config)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Model config:\n{json.dumps(asdict(config), indent=2)}")
 print0(f"Parameters: {num_params:,}")

@@ -29,8 +29,6 @@ from src.common import (
     all_reduce_mean,
     init_distributed,
     print0,
-)
-from src.models import ARCHITECTURES
 from src.models.kimi_k3 import KimiK3Config, KimiK3ForCausalLM
 from src.models.mtp import MTPBlock
 from src.training.draft import DraftConfig, DraftTrainer
@@ -96,8 +94,7 @@ vocab_size = math.ceil(train_loader.meta["vocab_size"] / 128) * 128
 
 # Build target model config -- use checkpoint config but override vocab_size
 # and ensure feature extraction is configured
-Config, ForCausalLM = ARCHITECTURES[config_file["arch"]]
-target_config = Config(**target_config_dict)
+target_config = KimiK3Config(**target_config_dict)
 # Ensure feature layers are set for extraction
 if args.feature_layers:
     target_config.feature_layer_indices = [int(x.strip()) for x in args.feature_layers.split(",")]

@@ -22,7 +22,7 @@ import torch
 from tokenizers import Tokenizer
 
 from src.engine import Engine
-from src.models import ARCHITECTURES
+from src.models import KimiK3Config, KimiK3ForCausalLM
 from src.models.mtp import MTPBlock
 from src.training.draft import DraftConfig, DraftTrainer
 from src.speculative import SpeculativeEngine
@@ -60,12 +60,9 @@ def load_models(args):
     # 1. Load Target Model from Stage 1 checkpoint
     print(f"Loading Stage 1 target checkpoint from {args.target_checkpoint}...")
     target_ckpt = torch.load(args.target_checkpoint, map_location="cpu")
-    config_file = json.loads(Path(args.config).read_text())
-    Config, ForCausalLM = ARCHITECTURES[config_file["arch"]]
-
-    target_config = Config(**target_ckpt["config"])
+    target_config = KimiK3Config(**target_ckpt["config"])
     with torch.device(device):
-        target_model = ForCausalLM(target_config)
+        target_model = KimiK3ForCausalLM(target_config)
     target_model.load_state_dict(target_ckpt["model"])
     target_model = target_model.to(device).eval()
     print(f"✓ Target model loaded ({sum(p.numel() for p in target_model.parameters()):,} parameters)")

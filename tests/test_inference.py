@@ -1,6 +1,6 @@
 """
-Check that decoding with the cache (prefill, then one token at a time) reproduces the full forward, for both
-architectures. From the repo root:
+Check that decoding with the cache (prefill, then one token at a time) reproduces the full forward.
+From the repo root:
 
 python -m tests.test_inference
 """
@@ -11,15 +11,14 @@ from pathlib import Path
 import torch
 
 from src.engine import Engine
-from src.models import ARCHITECTURES
+from src.models.kimi_k3 import KimiK3Config, KimiK3ForCausalLM
 
 
 def check(config_name, device, seq_len=40, prefill_len=25):
     config_file = json.loads(Path(f"configs/{config_name}.json").read_text())
-    Config, ForCausalLM = ARCHITECTURES[config_file["arch"]]
     torch.manual_seed(0)
     with torch.device(device):
-        model = ForCausalLM(Config(vocab_size=512, **config_file["model"])).eval()
+        model = KimiK3ForCausalLM(KimiK3Config(vocab_size=512, **config_file["model"])).eval()
     tokens = torch.randint(0, 512, (2, seq_len), device=device)
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
@@ -40,5 +39,4 @@ def check(config_name, device, seq_len=40, prefill_len=25):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    check("transformer_tiny", device)
     check("kimi_k3_tiny", device)
