@@ -13,10 +13,10 @@ import torch
 from tokenizers import Tokenizer
 
 from src.engine import Engine
-from src.models.kimi_k3 import KimiK3Config, KimiK3ForCausalLM
+from src.models import ARCHITECTURES
 
 parser = argparse.ArgumentParser(description="Generate text from a checkpoint")
-parser.add_argument("--config", default=None, help="optional json config (otherwise loaded from checkpoint)")
+parser.add_argument("--config", required=True, help="json config the model was trained with")
 parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--prompt", default="The capital of France is")
 parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B")
@@ -28,11 +28,12 @@ parser.add_argument("--num-samples", type=int, default=1)
 parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
 
+config_file = json.loads(Path(args.config).read_text())
+Config, ForCausalLM = ARCHITECTURES[config_file["arch"]]
 checkpoint = torch.load(args.checkpoint, map_location="cpu")
-config_dict = checkpoint["config"] if "config" in checkpoint else json.loads(Path(args.config).read_text())["model"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 with torch.device(device):
-    model = KimiK3ForCausalLM(KimiK3Config(**config_dict))
+    model = ForCausalLM(Config(**checkpoint["config"]))
 model.load_state_dict(checkpoint["model"])
 
 tokenizer = Tokenizer.from_pretrained(args.tokenizer)
