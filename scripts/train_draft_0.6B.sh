@@ -21,7 +21,7 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH//\/usr\/local\/gib\/lib64:/}"
 export NCCL_IB_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0
 
-torchrun --standalone --nproc_per_node="${GPUS:-4}" -m scripts.train_draft \
+torchrun --standalone --nproc_per_node="${GPUS:-4}" -m scripts.train_stage2 \
     --config configs/kimi_k3_0.6B_mtp.json \
     --target-checkpoint "${TARGET_CKPT}" \
     --data data/fineweb_edu \
