@@ -355,6 +355,7 @@ def test_draft_trainer_trajectory_matches_actual_inference_draft_path():
     """Verify DraftTrainer's single-anchor trajectory directly matches the actual inference draft path."""
     print("test_draft_trainer_trajectory_matches_actual_inference_draft_path...", end=" ", flush=True)
     from src.training.draft import DraftConfig, DraftTrainer
+    from tests.helpers import draft_forward_with_trajectories
 
     config = make_tiny_config()
     torch.manual_seed(42)
@@ -381,14 +382,14 @@ def test_draft_trainer_trajectory_matches_actual_inference_draft_path():
         target_features = target_res["features"]
         target_logits = target_res["logits"]
 
-        # Run vectorized DraftTrainer training forward pass
-        train_out = draft_trainer(
+        # Run vectorized DraftTrainer training forward pass with trajectory capture
+        train_out = draft_forward_with_trajectories(
+            draft_trainer,
             target_features=target_features,
             target_logits=target_logits,
             targets=targets,
             embed_fn=target_model.model.embed_tokens,
             lm_head_fn=target_model.lm_head,
-            return_trajectories=True,
         )
         train_hidden = train_out["draft_hidden"]  # list of length draft_steps
         train_logits = train_out["draft_logits"]  # list of length draft_steps

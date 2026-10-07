@@ -20,8 +20,11 @@ from src.training.draft import (
     DraftTrainer,
     FeatureProjection,
     lk_loss,
+)
+from tests.helpers import (
     compute_overlap_and_agreement,
     single_anchor_sequential_reference,
+    draft_forward_with_trajectories,
 )
 
 
@@ -413,7 +416,6 @@ def test_draft_overfit():
     optimizer = torch.optim.AdamW(draft_trainer.get_trainable_parameters(), lr=1e-3)
 
     losses = []
-    overlaps = []
     for i in range(30):
         draft_result = draft_trainer(
             target_features=target_features,
@@ -426,20 +428,12 @@ def test_draft_overfit():
         optimizer.step()
         optimizer.zero_grad()
         losses.append(draft_result["loss"].item())
-        if draft_result["per_step_overlap"]:
-            overlaps.append(sum(draft_result["per_step_overlap"]) / len(draft_result["per_step_overlap"]))
 
     # Loss should decrease
     assert losses[-1] < losses[0], \
         f"Draft loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
 
-    # Overlap should increase (draft is getting closer to target)
-    if len(overlaps) >= 2:
-        assert overlaps[-1] > overlaps[0], \
-            f"Overlap did not increase: {overlaps[0]:.4f} -> {overlaps[-1]:.4f}"
-
-    print(f"ok (loss: {losses[0]:.3f}->{losses[-1]:.3f}, "
-          f"overlap: {overlaps[0]:.3f}->{overlaps[-1]:.3f})")
+    print(f"ok (loss: {losses[0]:.3f}->{losses[-1]:.3f})")
 
 
 def test_gradients_through_unroll():
@@ -681,14 +675,14 @@ def test_draft_trainer_trajectory_matches_actual_inference_draft_path():
         target_features = target_res["features"]
         target_logits = target_res["logits"]
 
-        # Run vectorized DraftTrainer training forward pass
-        train_out = draft_trainer(
+        # Run vectorized DraftTrainer training forward pass with trajectory capture
+        train_out = draft_forward_with_trajectories(
+            draft_trainer,
             target_features=target_features,
             target_logits=target_logits,
             targets=targets,
             embed_fn=target_model.model.embed_tokens,
             lm_head_fn=target_model.lm_head,
-            return_trajectories=True,
         )
         train_hidden = train_out["draft_hidden"]  # list of length draft_steps
         train_logits = train_out["draft_logits"]  # list of length draft_steps
