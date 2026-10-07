@@ -47,7 +47,7 @@ echo " WandB Run Name:    ${WANDB_RUN}"
 echo " GPUs:              ${GPUS}"
 echo "======================================================================"
 
-torchrun --standalone --nproc_per_node="${GPUS}" -m scripts.train_stage2 \
+torchrun --standalone --nproc_per_node="${GPUS}" -m scripts.train_draft \
     --config configs/kimi_k3_0.6B_mtp.json \
     --target-checkpoint "${TARGET_CKPT}" \
     --feature-layers "0,4,27" \

@@ -10,7 +10,7 @@ The codebase is structured around three consecutive stages:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 1: Joint MTP Pretraining (scripts/train_stage1.py)               │
+│ Stage 1: Joint MTP Pretraining (scripts/train.py)                      │
 │ - Shared embedding & lm_head between backbone and MTP block            │
 │ - MTP block predicts token t+2 from backbone final hidden & token t+1  │
 │ - Loss = L_main + λ * L_mtp (λ = 0.3)                                  │
@@ -18,7 +18,7 @@ The codebase is structured around three consecutive stages:
                                     │ Pretrained target + MTP weights
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 2: Recursive Drafter Training (scripts/train_stage2.py)          │
+│ Stage 2: Recursive Drafter Training (scripts/train_draft.py)           │
 │ - Frozen target model produces low/mid/high representations            │
 │ - Feature projection Linear(3d, d) initialized as [0, 0, I]            │
 │ - Teacher-forced recursive unroll (K depths)                           │
@@ -48,10 +48,8 @@ The codebase is structured around three consecutive stages:
 │   ├── transformer_0.6B.json      # 0.6B Standard Transformer baseline
 │   └── transformer_tiny.json      # Tiny Transformer baseline
 ├── scripts/
-│   ├── train_stage1.py            # Stage 1 pretraining (MTP + causal LM)
-│   ├── train_stage2.py            # Stage 2 recursive drafter training (LK loss)
-│   ├── train.py                   # Alias entrypoint for train_stage1.py
-│   ├── train_draft.py             # Alias entrypoint for train_stage2.py
+│   ├── train.py                   # Pretraining loop (normal or with MTP)
+│   ├── train_draft.py             # Stage 2 recursive drafter training (LK loss)
 │   ├── generate.py                # Autoregressive generation from checkpoint
 │   ├── benchmark_speculative.py   # Benchmark speculative decoding speedup
 │   └── prepare_data.py            # FineWeb-Edu tokenization pipeline
@@ -98,12 +96,12 @@ For studying this codebase, read the core implementation in this order:
 
 ```bash
 # Kimi-K3 with MTP
-torchrun --standalone --nproc_per_node=4 -m scripts.train_stage1 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train \
     --config configs/kimi_k3_0.6B_mtp.json \
     --data data/fineweb_edu
 
 # Baseline Transformer architecture
-torchrun --standalone --nproc_per_node=4 -m scripts.train_stage1 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train \
     --config configs/transformer_0.6B.json \
     --data data/fineweb_edu
 ```
@@ -111,7 +109,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.train_stage1 \
 ### 2. Stage 2 Drafter Fine-Tuning
 
 ```bash
-torchrun --standalone --nproc_per_node=4 -m scripts.train_stage2 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train_draft \
     --config configs/kimi_k3_0.6B_mtp.json \
     --target-checkpoint out/kimi_k3_0.6B_mtp/ckpt_019073.pt \
     --data data/fineweb_edu \
