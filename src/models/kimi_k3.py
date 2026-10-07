@@ -189,59 +189,40 @@ class KimiK3ForCausalLM(nn.Module):
         # --- Training: compute main CE loss ---
         main_loss = F.cross_entropy(logits.float().flatten(0, 1), targets.flatten(), ignore_index=-100)
 
-        # Main top-1 agreement
-        with torch.no_grad():
-            valid_targets = targets != -100
-            if valid_targets.any():
-                main_agreement = (logits.argmax(-1)[valid_targets] == targets[valid_targets]).float().mean()
-            else:
-                main_agreement = torch.zeros((), device=main_loss.device)
-
         # --- No MTP: return scalar loss (backward compatible) ---
         if self.mtp_block is None:
             if return_features:
                 return {
                     "loss": main_loss,
                     "main_loss": main_loss,
-                    "main_agreement": main_agreement,
                     "features": features,
                 }
             return main_loss
 
         # --- MTP: compute shifted auxiliary CE ---
-        # Alignment (see todolist):
-        #   final_hidden[:, :-1]  = hidden states for positions 0..T-2
-        #   embed(targets[:, :-1]) = embeddings of tokens at positions 1..T-1
-        #   mtp_labels = targets[:, 1:] = tokens at positions 2..T
+        # Alignment:
+        #   final_hidden[:, :-1]   = h_t (positions 0..T-2)
+        #   embed(targets[:, :-1]) = embed(x_{t+1}) (positions 1..T-1)
+        #   mtp_labels = targets[:, 1:] = x_{t+2} (positions 2..T)
         final_hidden = features["final_hidden"]
 
-        mtp_hidden_input = final_hidden[:, :-1]     # (B, T-1, D)
-        # Mask ignored labels before embedding
-        mtp_target_tokens = targets[:, :-1].clone()  # (B, T-1)
+        mtp_hidden_input = final_hidden[:, :-1]
+        mtp_target_tokens = targets[:, :-1].clone()
         valid_mask = mtp_target_tokens != -100
-        mtp_target_tokens[~valid_mask] = 0  # safe index for embedding
-        mtp_embeddings = self.model.embed_tokens(mtp_target_tokens)  # (B, T-1, D)
-        # Zero out embeddings for ignored positions
+        mtp_target_tokens[~valid_mask] = 0
+        mtp_embeddings = self.model.embed_tokens(mtp_target_tokens)
         mtp_embeddings = mtp_embeddings * valid_mask.unsqueeze(-1).float()
 
-        mtp_labels = targets[:, 1:]  # (B, T-1)
+        mtp_labels = targets[:, 1:]
 
-        # Handle sequences too short for MTP
         if mtp_hidden_input.shape[1] == 0:
             mtp_loss = torch.zeros((), device=main_loss.device, dtype=main_loss.dtype)
-            mtp_agreement = torch.zeros((), device=main_loss.device)
         else:
             mtp_hidden_out = self.mtp_block(mtp_hidden_input, mtp_embeddings)
             mtp_logits = self.lm_head(self.mtp_block.get_output_hidden(mtp_hidden_out))
             mtp_loss = F.cross_entropy(
                 mtp_logits.float().flatten(0, 1), mtp_labels.flatten(), ignore_index=-100
             )
-            with torch.no_grad():
-                valid_mtp = mtp_labels != -100
-                if valid_mtp.any():
-                    mtp_agreement = (mtp_logits.argmax(-1)[valid_mtp] == mtp_labels[valid_mtp]).float().mean()
-                else:
-                    mtp_agreement = torch.zeros((), device=main_loss.device)
 
         total_loss = main_loss + self.config.mtp_loss_weight * mtp_loss
 
@@ -249,8 +230,6 @@ class KimiK3ForCausalLM(nn.Module):
             "loss": total_loss,
             "main_loss": main_loss,
             "mtp_loss": mtp_loss,
-            "mtp_agreement": mtp_agreement,
-            "main_agreement": main_agreement,
         }
         if return_features:
             ret["features"] = features

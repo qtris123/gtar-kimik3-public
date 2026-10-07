@@ -38,14 +38,11 @@ def evaluate(model: nn.Module, loader, steps: int, return_metrics: bool = False)
         loader: data loader.
         steps: evaluation steps.
         return_metrics: if True, returns a dict with 'val/loss', 'val/ppl',
-            and optional 'val/mtp_loss', 'val/mtp_agreement', 'val/main_agreement'.
-            If False (default), returns float val_loss.
+            and optional 'val/mtp_loss'. If False (default), returns float val_loss.
     """
     model.eval()
     total_loss = 0.0
     total_mtp_loss = 0.0
-    total_main_agree = 0.0
-    total_mtp_agree = 0.0
     has_mtp = False
 
     for _ in range(steps):
@@ -56,10 +53,6 @@ def evaluate(model: nn.Module, loader, steps: int, return_metrics: bool = False)
             if "mtp_loss" in result:
                 has_mtp = True
                 total_mtp_loss = total_mtp_loss + result["mtp_loss"]
-            if "mtp_agreement" in result:
-                total_mtp_agree = total_mtp_agree + result["mtp_agreement"]
-            if "main_agreement" in result:
-                total_main_agree = total_main_agree + result["main_agreement"]
         else:
             total_loss = total_loss + result
 
@@ -75,9 +68,6 @@ def evaluate(model: nn.Module, loader, steps: int, return_metrics: bool = False)
     }
     if has_mtp:
         metrics["val/mtp_loss"] = all_reduce_mean(total_mtp_loss / steps).item()
-        metrics["val/mtp_agreement"] = all_reduce_mean(total_mtp_agree / steps).item()
-    if isinstance(total_main_agree, torch.Tensor) or total_main_agree > 0:
-        metrics["val/main_agreement"] = all_reduce_mean(total_main_agree / steps).item()
 
     return metrics
 

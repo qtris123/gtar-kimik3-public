@@ -412,9 +412,9 @@ def test_inference_compatibility():
 
 
 
-def test_mtp_agreement_metrics():
-    """Verify mtp_agreement and main_agreement computation and evaluate() metrics."""
-    print("test_mtp_agreement_metrics...", end=" ")
+def test_mtp_evaluation_metrics():
+    """Verify loss decomposition in model output and evaluate() metrics."""
+    print("test_mtp_evaluation_metrics...", end=" ")
     from src.common import evaluate
 
     config = make_tiny_config()
@@ -426,10 +426,9 @@ def test_mtp_agreement_metrics():
     targets = torch.randint(0, config.vocab_size, (2, 16))
     result = model(inputs, targets)
 
-    assert "mtp_agreement" in result, "Missing mtp_agreement in result dict"
-    assert "main_agreement" in result, "Missing main_agreement in result dict"
-    assert 0.0 <= result["mtp_agreement"].item() <= 1.0
-    assert 0.0 <= result["main_agreement"].item() <= 1.0
+    assert "loss" in result, "Missing loss in result dict"
+    assert "main_loss" in result, "Missing main_loss in result dict"
+    assert "mtp_loss" in result, "Missing mtp_loss in result dict"
 
     # Test evaluate with return_metrics=True
     def mock_loader():
@@ -441,13 +440,10 @@ def test_mtp_agreement_metrics():
     assert "val/loss" in metrics
     assert "val/ppl" in metrics
     assert "val/mtp_loss" in metrics
-    assert "val/mtp_agreement" in metrics
-    assert 0.0 <= metrics["val/mtp_agreement"] <= 1.0
 
     # Test default backward compatibility (returns scalar float)
     scalar_loss = evaluate(model, mock_loader(), steps=2, return_metrics=False)
     assert isinstance(scalar_loss, float)
-
     print("ok")
 
 
@@ -469,7 +465,7 @@ if __name__ == "__main__":
     test_feature_extraction()
     test_cpu_smoke_overfit()
     test_inference_compatibility()
-    test_mtp_agreement_metrics()
+    test_mtp_evaluation_metrics()
 
     print("=" * 60)
     print("All Stage 1 tests passed!")
