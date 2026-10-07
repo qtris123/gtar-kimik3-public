@@ -169,3 +169,48 @@ def draft_forward_with_trajectories(
         "draft_hidden": draft_hiddens,
         "draft_logits": draft_logits_list,
     }
+
+
+def spec_engine_draft_trajectory(
+    spec_engine,
+    prompt_tokens: torch.Tensor,
+    teacher_forced_tokens: torch.Tensor,
+    draft_steps: int = 4,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Test helper: runs the actual inference draft path for an anchor with persistent prefix state."""
+    prompt_tokens = prompt_tokens.to(spec_engine.device)
+    teacher_forced_tokens = teacher_forced_tokens.to(spec_engine.device)
+    prompt_len = prompt_tokens.shape[1]
+    dummy_cache = spec_engine.target_model.make_cache(1, prompt_len + 10, spec_engine.dtype)
+    all_fused, _ = spec_engine._get_hidden_and_logits(prompt_tokens, dummy_cache)
+    anchor_hidden = all_fused[:, -1:, :]
+
+    if prompt_len > 1:
+        draft_prefix_k, draft_prefix_v = spec_engine.build_draft_prefix(
+            all_fused[:, :-1, :], prompt_tokens[:, 1:]
+        )
+    else:
+        draft_prefix_k, draft_prefix_v = None, None
+
+    draft_cache = DraftTTTCache(
+        prefix_k=draft_prefix_k,
+        prefix_v=draft_prefix_v,
+        mode="single_anchor",
+    )
+
+    hidden_list = []
+    logits_list = []
+    curr_hidden = anchor_hidden
+
+    for step in range(draft_steps):
+        tok = teacher_forced_tokens[:, step : step + 1]
+        token_emb = spec_engine.target_model.model.embed_tokens(tok)
+        draft_out = spec_engine.draft_block(curr_hidden, token_emb, ttt_cache=draft_cache)
+        draft_logits = spec_engine.target_model.lm_head(
+            spec_engine.draft_block.get_output_hidden(draft_out)
+        )
+        hidden_list.append(draft_out)
+        logits_list.append(draft_logits)
+        curr_hidden = draft_out
+
+    return hidden_list, logits_list
